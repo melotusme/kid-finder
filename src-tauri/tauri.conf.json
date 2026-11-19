@@ -1,0 +1,37 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "找娃助手",
+  "mainBinaryName": "kid-finder",
+  "version": "0.1.0",
+  "identifier": "com.kidfinder.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      { "title": "找娃助手", "width": 1200, "height": 820, "minWidth": 900, "minHeight": 600, "dragDropEnabled": true }
+    ],
+    "security": {
+      "csp": null,
+      "assetProtocol": { "enable": true, "scope": ["$APPDATA/**", "$APPLOCALDATA/**"] }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "app", "dmg"],
+    "createUpdaterArtifacts": true,
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
+    "windows": { "nsis": { "languages": ["SimpChinese"], "installMode": "currentUser" } },
+    "macOS": { "minimumSystemVersion": "11.0" }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDdGQ0MzODRCRTg0NTEwOEEKUldTS0VFWG9TempNZnp3N1UvT2JUaUVxUkxJdXkxbUp0QTJrUHJSaTFNaXBmcDNWd0xVODlzdkYK",
+      "endpoints": ["https://github.com/melotusme/kid-finder/releases/latest/download/latest.json"],
+      "windows": { "installMode": "passive" }
+    }
+  }
+}
