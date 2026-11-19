@@ -51,4 +51,6 @@ jobs:
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
+          # GitHub strips non-ASCII from asset names, which breaks latest.json signature lookup
+          assetNamePattern: "kid-finder_[version]_[platform]_[arch][setup][ext]"
           args: ${{ matrix.args }}
