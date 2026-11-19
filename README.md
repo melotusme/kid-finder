@@ -23,7 +23,7 @@
 到 [Releases](https://github.com/melotusme/kid-finder/releases/latest) 下载：
 
 - Windows：`*_x64-setup.exe`
-- macOS：`*_aarch64.dmg`。应用未经 Apple 签名，首次打开若提示「已损坏」，在终端执行：
+- macOS（13.4 及以上，Apple Silicon）：`*_aarch64.dmg`。应用未经 Apple 签名，首次打开若提示「已损坏」，在终端执行：
   `xattr -cr /Applications/找娃助手.app`
 
 ## 开发

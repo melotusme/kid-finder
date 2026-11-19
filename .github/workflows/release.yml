@@ -40,6 +40,8 @@ jobs:
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # ort's prebuilt ONNX Runtime targets macOS 13.4; lower targets fail to link (___isPlatformVersionAtLeast)
+          MACOSX_DEPLOYMENT_TARGET: "13.4"
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
