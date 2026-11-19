@@ -5,7 +5,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
-import { api, src, fmtTime, type Status, type Person, type Hit, type Progress, type ImportReport, type Album, type LoginTicket } from "./api";
+import { api, src, fmtTime, parseTime, padSegments, loadClipSettings, saveClipSettings, type ClipSettings, type Status, type Person, type Hit, type Progress, type ImportReport, type Album, type LoginTicket } from "./api";
 
 type Tab = "kids" | "import" | "results" | "settings";
 const MEDIA_EXT = ["jpg", "jpeg", "png", "webp", "bmp", "gif", "mp4", "mov", "m4v", "avi", "mkv", "3gp", "webm"];
@@ -413,7 +413,13 @@ function Results({ persons, status, refresh, notify }: Common & { persons: Perso
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [filter, setFilter] = useState<"all" | "image" | "video">("all");
   const [preview, setPreview] = useState<Hit | null>(null);
-
+  const [clip, setClip] = useState<ClipSettings>(loadClipSettings);
+  const [edits, setEdits] = useState<Record<number, [number, number][]>>({});
+  const setClipS = (c: ClipSettings) => {
+    setClip(c);
+    saveClipSettings(c);
+  };
+  const segsOf = (h: Hit) => edits[h.mediaId] ?? padSegments(h.segments, clip, h.duration);
   const load = useCallback(async () => {
     if (pid === null) return;
     const h = await api.search(pid, threshold);
@@ -438,9 +444,9 @@ function Results({ persons, status, refresh, notify }: Common & { persons: Perso
   const doExport = async () => {
     const dir = await open({ directory: true, title: "导出到哪个文件夹？" });
     if (!dir) return;
-    const items = hits.filter((h) => selected.has(h.mediaId)).map((h) => ({ mediaId: h.mediaId, segments: h.segments }));
+    const items = hits.filter((h) => selected.has(h.mediaId)).map((h) => ({ mediaId: h.mediaId, segments: h.kind === "video" ? segsOf(h) : [] }));
     try {
-      const r = await api.exportItems(dir as string, items);
+      const r = await api.exportItems(dir as string, items, clip.fade);
       notify(
         `已导出 ${r.images} 张照片、${r.clips} 段视频` +
           (r.skipped ? `，${r.skipped} 个已存在跳过` : "") +
@@ -490,7 +496,27 @@ function Results({ persons, status, refresh, notify }: Common & { persons: Perso
           导出选中
         </button>
       </div>
-      <p className="hint">视频只会导出孩子出现的片段。认错了点 ✕，认对了点 ✓ 可以让识别越来越准。</p>
+      <p className="hint">视频只会导出孩子出现的片段，点开视频可以逐段微调起止时间。认错了点 ✕，认对了点 ✓ 可以让识别越来越准。</p>
+      {hits.some((h) => h.kind === "video") && (
+        <div className="row card cliprow">
+          <b>视频片段</b>
+          <label>
+            宝宝出现前提前
+            <input type="number" min={0} max={30} step={0.5} value={clip.lead} onChange={(e) => setClipS({ ...clip, lead: Math.max(0, Number(e.target.value)) })} />
+            秒开始
+          </label>
+          <label>
+            离开后多留
+            <input type="number" min={0} max={30} step={0.5} value={clip.tail} onChange={(e) => setClipS({ ...clip, tail: Math.max(0, Number(e.target.value)) })} />
+            秒
+          </label>
+          <label>
+            淡入淡出
+            <input type="number" min={0} max={3} step={0.1} value={clip.fade} onChange={(e) => setClipS({ ...clip, fade: Math.max(0, Number(e.target.value)) })} />
+            秒（0 为直接切）
+          </label>
+        </div>
+      )}
       <div className="grid">
         {shown.map((h) => (
           <div key={h.mediaId} className={"tile" + (selected.has(h.mediaId) ? " sel" : "")}>
@@ -509,7 +535,8 @@ function Results({ persons, status, refresh, notify }: Common & { persons: Perso
               )}
               {h.kind === "video" && (
                 <div className="badge">
-                  ▶ {h.segments.length} 段 · {fmtTime(h.segments.reduce((s, [a, b]) => s + b - a, 0))}
+                  ▶ {segsOf(h).length} 段 · {fmtTime(segsOf(h).reduce((s, [a, b]) => s + b - a, 0))}
+                  {h.mediaId in edits && " · 已手动调整"}
                 </div>
               )}
             </div>
@@ -535,7 +562,19 @@ function Results({ persons, status, refresh, notify }: Common & { persons: Perso
             {preview.kind === "image" ? (
               <img src={src(preview.path)} />
             ) : (
-              <VideoPreview hit={preview} />
+              <VideoPreview
+                hit={preview}
+                segs={segsOf(preview)}
+                edited={preview.mediaId in edits}
+                onChange={(s) =>
+                  setEdits((e) => {
+                    const n = { ...e };
+                    if (s === null) delete n[preview.mediaId];
+                    else n[preview.mediaId] = s;
+                    return n;
+                  })
+                }
+              />
             )}
             <div className="row">
               <span>{preview.origName}</span>
@@ -552,20 +591,87 @@ function Results({ persons, status, refresh, notify }: Common & { persons: Perso
   );
 }
 
-function VideoPreview({ hit }: { hit: Hit }) {
+function VideoPreview({ hit, segs, edited, onChange }: { hit: Hit; segs: [number, number][]; edited: boolean; onChange: (s: [number, number][] | null) => void }) {
   const ref = useRef<HTMLVideoElement>(null);
+  const stopAt = useRef<number | null>(null);
+  const now = () => Math.round((ref.current?.currentTime ?? 0) * 10) / 10;
+  const play = (a: number, b?: number) => {
+    const v = ref.current;
+    if (!v) return;
+    stopAt.current = b ?? null;
+    v.currentTime = a;
+    v.play();
+  };
+  const set = (i: number, seg: [number, number]) => {
+    const n = segs.map((s, k) => (k === i ? seg : s));
+    onChange(n.sort((x, y) => x[0] - y[0]));
+  };
   return (
     <>
-      <video ref={ref} src={src(hit.path)} controls autoPlay onLoadedMetadata={() => ref.current && (ref.current.currentTime = hit.segments[0]?.[0] ?? 0)} />
-      <div className="row">
-        宝宝出现的片段：
-        {hit.segments.map(([a, b], i) => (
-          <button key={i} className="ghost" onClick={() => ref.current && ((ref.current.currentTime = a), ref.current.play())}>
-            {fmtTime(a)}–{fmtTime(b)}
+      <video
+        ref={ref}
+        src={src(hit.path)}
+        controls
+        autoPlay
+        onLoadedMetadata={() => ref.current && (ref.current.currentTime = segs[0]?.[0] ?? 0)}
+        onTimeUpdate={() => {
+          const v = ref.current;
+          if (v && stopAt.current !== null && v.currentTime >= stopAt.current) {
+            v.pause();
+            stopAt.current = null;
+          }
+        }}
+      />
+      <div className="segs">
+        <div className="row">
+          <b>导出的片段</b>
+          <span className="muted small">（时间可直接改，格式 分:秒；也可以暂停到想要的位置后点「设为起点/终点」）</span>
+          <div className="spacer" />
+          <button className="ghost" onClick={() => onChange([...segs, [now(), now() + 5]].sort((x, y) => x[0] - y[0]) as [number, number][])}>
+            + 从当前位置加一段
           </button>
+          {edited && (
+            <button className="ghost" onClick={() => onChange(null)}>
+              恢复自动
+            </button>
+          )}
+        </div>
+        {segs.length === 0 && <p className="muted small">没有片段，导出时会复制整个视频。</p>}
+        {segs.map(([a, b], i) => (
+          <div className="row seg" key={i}>
+            <span className="muted">片段 {i + 1}</span>
+            <TimeInput value={a} onCommit={(v) => set(i, [v, Math.max(b, v + 0.5)])} />
+            –
+            <TimeInput value={b} onCommit={(v) => set(i, [Math.min(a, v - 0.5), v].map((x) => Math.max(0, x)) as [number, number])} />
+            <span className="muted small">{(b - a).toFixed(1)} 秒</span>
+            <button className="ghost" onClick={() => set(i, [now(), Math.max(b, now() + 0.5)])}>设为起点</button>
+            <button className="ghost" onClick={() => set(i, [Math.min(a, Math.max(0, now() - 0.5)), now()])}>设为终点</button>
+            <button className="ghost" onClick={() => play(a, b)}>▶ 试看</button>
+            <button className="icon" title="删除这段" onClick={() => onChange(segs.filter((_, k) => k !== i))}>✕</button>
+          </div>
         ))}
       </div>
     </>
+  );
+}
+
+function TimeInput({ value, onCommit }: { value: number; onCommit: (v: number) => void }) {
+  const fmt = (s: number) => `${Math.floor(s / 60)}:${(s % 60).toFixed(1).padStart(4, "0")}`;
+  const [text, setText] = useState(fmt(value));
+  useEffect(() => setText(fmt(value)), [value]);
+  const commit = () => {
+    const v = parseTime(text);
+    if (v === null) setText(fmt(value));
+    else if (v !== value) onCommit(v);
+  };
+  return (
+    <input
+      className="time"
+      value={text}
+      onChange={(e) => setText(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => e.key === "Enter" && (e.target as HTMLInputElement).blur()}
+    />
   );
 }
 

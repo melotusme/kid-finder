@@ -379,10 +379,10 @@ pub fn search(c: &Connection, person_id: i64, threshold: f32) -> Result<Vec<Hit>
     Ok(hits)
 }
 
-/// Turn the sampled timestamps (1 fps) where the kid appears into padded, merged clips.
+/// Turn the sampled timestamps (1 fps) where the kid appears into merged clips.
+/// No lead-in/tail padding here: the UI applies the user's 提前/延后 settings.
 fn merge_segments(mut times: Vec<f64>, duration: Option<f64>) -> Vec<[f64; 2]> {
     const GAP: f64 = 3.0;
-    const PAD: f64 = 1.5;
     times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     times.dedup();
     let mut segs: Vec<[f64; 2]> = vec![];
@@ -393,7 +393,7 @@ fn merge_segments(mut times: Vec<f64>, duration: Option<f64>) -> Vec<[f64; 2]> {
         }
     }
     let end_max = duration.map(|d| d + 1.0).unwrap_or(f64::MAX);
-    segs.into_iter().map(|[a, b]| [(a - PAD).max(0.0), (b + 1.0 + PAD).min(end_max)]).collect()
+    segs.into_iter().map(|[a, b]| [a, (b + 1.0).min(end_max)]).collect()
 }
 
 // ---------------- export ----------------
@@ -424,7 +424,23 @@ fn date_prefix(time: &str) -> String {
     time.chars().take(10).filter(|c| c.is_ascii_digit()).collect()
 }
 
-pub fn export(app: &AppHandle, out_dir: &Path, items: Vec<ExportItem>) -> Result<ExportReport> {
+/// Build the ffmpeg command for one clip. `fade` seconds of fade-in/out (0 = hard cut).
+fn clip_cmd(ff: &Path, src: &Path, a: f64, len: f64, fade: f64, audio_fx: bool, dest: &Path) -> Command {
+    let mut c = ffmpeg_cmd(ff);
+    c.arg("-y").arg("-ss").arg(format!("{a:.2}")).arg("-i").arg(src).arg("-t").arg(format!("{len:.2}"));
+    let f = fade.min(len / 3.0);
+    if f > 0.05 {
+        let out = (len - f).max(0.0);
+        c.arg("-vf").arg(format!("fade=t=in:st=0:d={f:.2},fade=t=out:st={out:.2}:d={f:.2}"));
+        if audio_fx {
+            c.arg("-af").arg(format!("afade=t=in:st=0:d={f:.2},afade=t=out:st={out:.2}:d={f:.2}"));
+        }
+    }
+    c.args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart"]).arg(dest);
+    c
+}
+
+pub fn export(app: &AppHandle, out_dir: &Path, items: Vec<ExportItem>, fade: f64) -> Result<ExportReport> {
     let st = app.state::<AppState>();
     std::fs::create_dir_all(out_dir)?;
     let ffmpeg = download::find_ffmpeg(&st);
@@ -459,11 +475,11 @@ pub fn export(app: &AppHandle, out_dir: &Path, items: Vec<ExportItem>) -> Result
                     rep.skipped += 1;
                     continue;
                 }
-                let mut c = ffmpeg_cmd(ff);
-                c.arg("-y").arg("-ss").arg(format!("{a:.2}")).arg("-i").arg(src).arg("-t").arg(format!("{:.2}", (b - a).max(0.5)))
-                    .args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac", "-movflags", "+faststart"])
-                    .arg(&dest);
-                run(c)?;
+                let len = (b - a).max(0.5);
+                // Videos without an audio track make -af fail; retry without the audio fade.
+                if run(clip_cmd(ff, src, *a, len, fade, true, &dest)).is_err() {
+                    run(clip_cmd(ff, src, *a, len, fade, false, &dest))?;
+                }
                 rep.clips += 1;
             }
             Ok(())

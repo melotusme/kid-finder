@@ -57,8 +57,8 @@ export const api = {
   search: (personId: number, threshold: number) => invoke<Hit[]>("search", { personId, threshold }),
   confirmFace: (faceId: number, personId: number) => invoke<void>("confirm_face", { faceId, personId }),
   rejectFace: (faceId: number, personId: number) => invoke<void>("reject_face", { faceId, personId }),
-  exportItems: (outDir: string, items: { mediaId: number; segments: [number, number][] }[]) =>
-    invoke<ExportReport>("export", { outDir, items }),
+  exportItems: (outDir: string, items: { mediaId: number; segments: [number, number][] }[], fade: number) =>
+    invoke<ExportReport>("export", { outDir, items, fade }),
   qxcCreateLogin: () => invoke<LoginTicket>("qxc_create_login"),
   qxcCheckLogin: (token: string) => invoke<string | null>("qxc_check_login", { token }),
   qxcLogout: () => invoke<void>("qxc_logout"),
@@ -69,3 +69,33 @@ export const api = {
 export const src = (p: string | null | undefined) => (p ? convertFileSrc(p) : "");
 
 export const fmtTime = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+
+/** "1:23" / "83" / "1:23.5" -> seconds; null if unparsable. */
+export const parseTime = (v: string): number | null => {
+  const m = v.trim().match(/^(?:(\d+)[:：])?(\d+(?:\.\d+)?)$/);
+  return m ? Number(m[1] ?? 0) * 60 + Number(m[2]) : null;
+};
+
+export type ClipSettings = { lead: number; tail: number; fade: number };
+const CLIP_KEY = "clipSettings";
+export const loadClipSettings = (): ClipSettings => {
+  try {
+    return { lead: 2, tail: 2, fade: 0.5, ...JSON.parse(localStorage.getItem(CLIP_KEY) ?? "{}") };
+  } catch {
+    return { lead: 2, tail: 2, fade: 0.5 };
+  }
+};
+export const saveClipSettings = (s: ClipSettings) => localStorage.setItem(CLIP_KEY, JSON.stringify(s));
+
+/** Apply lead-in / tail padding, clamp to the video length and merge overlaps. */
+export const padSegments = (segs: [number, number][], s: ClipSettings, duration: number | null): [number, number][] => {
+  const max = duration ? duration + 1 : Infinity;
+  const out: [number, number][] = [];
+  for (const [a, b] of [...segs].sort((x, y) => x[0] - y[0])) {
+    const p: [number, number] = [Math.max(0, a - s.lead), Math.min(max, b + s.tail)];
+    const last = out[out.length - 1];
+    if (last && p[0] <= last[1]) last[1] = Math.max(last[1], p[1]);
+    else out.push(p);
+  }
+  return out;
+};

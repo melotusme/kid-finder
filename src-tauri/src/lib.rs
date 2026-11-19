@@ -331,8 +331,8 @@ async fn reject_face(app: AppHandle, face_id: i64, person_id: i64) -> CmdResult<
 }
 
 #[tauri::command]
-async fn export(app: AppHandle, out_dir: String, items: Vec<media::ExportItem>) -> CmdResult<media::ExportReport> {
-    blocking(move || media::export(&app, std::path::Path::new(&out_dir), items)).await
+async fn export(app: AppHandle, out_dir: String, items: Vec<media::ExportItem>, fade: Option<f64>) -> CmdResult<media::ExportReport> {
+    blocking(move || media::export(&app, std::path::Path::new(&out_dir), items, fade.unwrap_or(0.0))).await
 }
 
 // ---------------- 群相册 ----------------
