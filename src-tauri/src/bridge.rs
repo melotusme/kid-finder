@@ -1,25 +1,30 @@
 //! Local loopback-only HTTP bridge (127.0.0.1:27431) for the Chrome extension on qxc.hi.cn.
-//! Reuses the desktop app's native ONNX Runtime FaceEngine and enrolled baby embeddings.
+//! Reuses the desktop app's native ONNX Runtime FaceEngine, enrolled baby embeddings, ffmpeg
+//! video analyzer/clipper, and persists scanned photo/video embeddings in SQLite so already-scanned
+//! items are never downloaded or inferred again across restarts or incremental daily scans.
 use crate::{db, download, face, media, AppState};
 use anyhow::{anyhow, bail, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use futures_util::stream::{self, StreamExt};
-use rusqlite::params;
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
+use tauri_plugin_opener::OpenerExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 pub const BRIDGE_PORT: u16 = 27431;
 const MAX_HEADER_BYTES: usize = 32 * 1024;
 const MAX_BODY_BYTES: usize = 25 * 1024 * 1024;
+const MAX_VIDEO_BYTES: u64 = 500 * 1024 * 1024;
 const MAX_CACHE_ENTRIES: usize = 4000;
 
-/// Cached per-URL faces: list of (normalized [x1,y1,x2,y2], 512-d L2-normalized embedding).
+/// Cached per-item faces: list of (normalized [x1,y1,x2,y2], 512-d L2-normalized embedding).
 pub type CachedFaces = Vec<([f32; 4], Vec<f32>)>;
 
 pub fn start(app: AppHandle) {
@@ -112,8 +117,36 @@ async fn handle_conn(app: AppHandle, mut stream: TcpStream) -> Result<()> {
             Ok(v) => (200, v),
             Err(e) => (500, json!({"ok": false, "error": format!("{e:#}")})),
         },
+        ("POST", "/api/check-scanned") => match serde_json::from_slice::<CheckScannedReq>(&body) {
+            Ok(req) => match api_check_scanned(&app, req).await {
+                Ok(v) => (200, v),
+                Err(e) => (400, json!({"ok": false, "error": format!("{e:#}")})),
+            },
+            Err(e) => (400, json!({"ok": false, "error": format!("参数错误: {e}")})),
+        },
         ("POST", "/api/match-urls") => match serde_json::from_slice::<MatchReq>(&body) {
             Ok(req) => match api_match_urls(&app, req).await {
+                Ok(v) => (200, v),
+                Err(e) => (400, json!({"ok": false, "error": format!("{e:#}")})),
+            },
+            Err(e) => (400, json!({"ok": false, "error": format!("参数错误: {e}")})),
+        },
+        ("POST", "/api/analyze-video") => match serde_json::from_slice::<AnalyzeVideoReq>(&body) {
+            Ok(req) => match api_analyze_video(&app, req).await {
+                Ok(v) => (200, v),
+                Err(e) => (400, json!({"ok": false, "error": format!("{e:#}")})),
+            },
+            Err(e) => (400, json!({"ok": false, "error": format!("参数错误: {e}")})),
+        },
+        ("POST", "/api/export-clips") => match serde_json::from_slice::<ExportClipsReq>(&body) {
+            Ok(req) => match api_export_clips(&app, req).await {
+                Ok(v) => (200, v),
+                Err(e) => (400, json!({"ok": false, "error": format!("{e:#}")})),
+            },
+            Err(e) => (400, json!({"ok": false, "error": format!("参数错误: {e}")})),
+        },
+        ("POST", "/api/open-export-dir") => match serde_json::from_slice::<OpenExportDirReq>(&body) {
+            Ok(req) => match api_open_export_dir(&app, req).await {
                 Ok(v) => (200, v),
                 Err(e) => (400, json!({"ok": false, "error": format!("{e:#}")})),
             },
@@ -132,6 +165,10 @@ async fn handle_conn(app: AppHandle, mut stream: TcpStream) -> Result<()> {
                 Err(e) => (400, json!({"ok": false, "error": format!("{e:#}")})),
             },
             Err(e) => (400, json!({"ok": false, "error": format!("参数错误: {e}")})),
+        },
+        ("POST", "/api/clear-web-cache") => match api_clear_web_cache(&app).await {
+            Ok(v) => (200, v),
+            Err(e) => (500, json!({"ok": false, "error": format!("{e:#}")})),
         },
         _ => (404, json!({"ok": false, "error": "Not found"})),
     };
@@ -180,6 +217,140 @@ async fn write_response(stream: &mut TcpStream, status: u16, origin: Option<&str
     Ok(())
 }
 
+// ---------------- SQLite persistent web scan cache & video scoring ----------------
+
+fn normalize_item_id(id: &str, url: &str) -> String {
+    let base = if !id.is_empty() { id } else { url };
+    base.split('?').next().unwrap_or(base).to_string()
+}
+
+/// Load persisted faces for an image item_id from SQLite if it has been scanned before.
+/// Returns `Ok(Some(vec![]))` when the photo was scanned and had 0 faces, or `Ok(None)` if never scanned.
+pub fn load_db_scan(c: &Connection, item_id: &str) -> Result<Option<CachedFaces>> {
+    let exists: Option<i64> = c
+        .query_row("SELECT 1 FROM web_scans WHERE item_id=?1", [item_id], |r| r.get(0))
+        .optional()?;
+    if exists.is_none() {
+        return Ok(None);
+    }
+    let mut s = c.prepare("SELECT x1, y1, x2, y2, embedding FROM web_faces WHERE item_id=?1")?;
+    let rows = s
+        .query_map([item_id], |r| {
+            let bbox = [r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?];
+            let blob: Vec<u8> = r.get(4)?;
+            Ok((bbox, db::blob_to_emb(&blob)))
+        })?
+        .collect::<rusqlite::Result<CachedFaces>>()?;
+    Ok(Some(rows))
+}
+
+pub fn save_db_scans(c: &mut Connection, entries: &HashMap<String, CachedFaces>) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let now = db::now();
+    let tx = c.transaction()?;
+    for (item_id, faces) in entries {
+        tx.execute(
+            "INSERT INTO web_scans(item_id, scanned_at) VALUES(?1, ?2) ON CONFLICT(item_id) DO UPDATE SET scanned_at=excluded.scanned_at",
+            params![item_id, now],
+        )?;
+        tx.execute("DELETE FROM web_faces WHERE item_id=?1", [item_id])?;
+        for (bbox, emb) in faces {
+            tx.execute(
+                "INSERT INTO web_faces(item_id, x1, y1, x2, y2, embedding) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![item_id, bbox[0], bbox[1], bbox[2], bbox[3], db::emb_to_blob(emb)],
+            )?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn score_faces(faces: &CachedFaces, refs: &[Vec<f32>]) -> (f32, Option<[f32; 4]>) {
+    let mut max_score = 0.0f32;
+    let mut best_bbox: Option<[f32; 4]> = None;
+    for (bbox, emb) in faces {
+        let sim = refs.iter().map(|q| face::cosine(q, emb)).fold(f32::MIN, f32::max);
+        if sim > max_score {
+            max_score = sim;
+            best_bbox = Some(*bbox);
+        }
+    }
+    (max_score, best_bbox)
+}
+
+struct VideoScore {
+    media_id: i64,
+    duration: Option<f64>,
+    max_score: f32,
+    face_count: usize,
+    segments: Vec<[f64; 2]>,
+}
+
+/// Score an already-analyzed video in `media` / `faces` against `refs` at `threshold`.
+fn score_analyzed_video(c: &Connection, media_id: i64, person_id: Option<i64>, refs: &[Vec<f32>], threshold: f32) -> Result<VideoScore> {
+    let duration: Option<f64> = c.query_row("SELECT duration FROM media WHERE id=?1", [media_id], |r| r.get(0))?;
+    let rejected: std::collections::HashSet<i64> = match person_id {
+        Some(pid) => c
+            .prepare("SELECT face_id FROM rejections WHERE person_id=?1")?
+            .query_map([pid], |r| r.get(0))?
+            .flatten()
+            .collect(),
+        None => std::collections::HashSet::new(),
+    };
+    let mut s = c.prepare("SELECT id, t, embedding FROM faces WHERE media_id=?1")?;
+    let mut rows = s.query([media_id])?;
+    let mut max_score = 0.0f32;
+    let mut face_count = 0usize;
+    let mut times: Vec<f64> = vec![];
+    while let Some(r) = rows.next()? {
+        face_count += 1;
+        let fid: i64 = r.get(0)?;
+        if rejected.contains(&fid) || refs.is_empty() {
+            continue;
+        }
+        let t: Option<f64> = r.get(1)?;
+        let emb = db::blob_to_emb(&r.get::<_, Vec<u8>>(2)?);
+        let sim = refs.iter().map(|q| face::cosine(q, &emb)).fold(f32::MIN, f32::max);
+        if sim > max_score {
+            max_score = sim;
+        }
+        if sim >= threshold {
+            if let Some(ts) = t {
+                times.push(ts);
+            }
+        }
+    }
+    let segments = if times.is_empty() { vec![] } else { media::merge_segments(times, duration) };
+    Ok(VideoScore { media_id, duration, max_score, face_count, segments })
+}
+
+fn find_analyzed_video_by_remote(c: &Connection, remote_id: &str) -> Result<Option<i64>> {
+    Ok(c.query_row(
+        "SELECT id FROM media WHERE remote_id=?1 AND kind='video' AND status=1",
+        [remote_id],
+        |r| r.get(0),
+    )
+    .optional()?)
+}
+
+fn default_export_root(app: &AppHandle) -> PathBuf {
+    if let Ok(dl) = app.path().download_dir() {
+        return dl.join("找娃助手导出");
+    }
+    app.state::<AppState>().paths.data.join("exports")
+}
+
+fn safe_folder_name(name: &str) -> String {
+    let cleaned: String = name
+        .trim()
+        .chars()
+        .map(|c| if r#"\/:*?"<>|"#.contains(c) { '_' } else { c })
+        .collect();
+    if cleaned.is_empty() { "宝宝".into() } else { cleaned }
+}
+
 // ---------------- endpoints ----------------
 
 #[derive(Serialize)]
@@ -196,8 +367,13 @@ async fn api_status(app: &AppHandle) -> Result<Value> {
     tauri::async_runtime::spawn_blocking(move || -> Result<Value> {
         let st = app.state::<AppState>();
         let models_ready = download::models_ready(&st.paths);
+        let ffmpeg_ready = download::find_ffmpeg(&st).is_some();
+        let export_root = default_export_root(&app).to_string_lossy().to_string();
         let c = st.db.lock().unwrap();
         let thresh: f32 = db::get_setting(&c, "threshold").and_then(|v| v.parse().ok()).unwrap_or(0.40);
+        let scanned_count: i64 = c.query_row("SELECT COUNT(*) FROM web_scans", [], |r| r.get(0))?;
+        let video_scanned_count: i64 =
+            c.query_row("SELECT COUNT(*) FROM media WHERE kind='video' AND status=1", [], |r| r.get(0))?;
         let mut ps: Vec<(i64, String)> = c
             .prepare("SELECT id, name FROM persons ORDER BY id")?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -220,8 +396,129 @@ async fn api_status(app: &AppHandle) -> Result<Value> {
             "ok": true,
             "version": env!("CARGO_PKG_VERSION"),
             "modelsReady": models_ready,
+            "ffmpegReady": ffmpeg_ready,
             "threshold": thresh,
+            "scannedCount": scanned_count,
+            "videoScannedCount": video_scanned_count,
+            "defaultExportDir": export_root,
             "persons": persons,
+        }))
+    })
+    .await?
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckScannedReq {
+    person_id: Option<i64>,
+    threshold: Option<f32>,
+    ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckScannedItem {
+    id: String,
+    kind: String,
+    scanned: bool,
+    cached: bool,
+    max_score: f32,
+    face_count: usize,
+    best_bbox: Option<[f32; 4]>,
+    media_id: Option<i64>,
+    duration: Option<f64>,
+    segments: Vec<[f64; 2]>,
+}
+
+/// Fast local-only lookup (0 network, 0 ONNX) to identify which page photos AND videos have
+/// already been scanned before and compute their scores/segments against the selected baby.
+async fn api_check_scanned(app: &AppHandle, req: CheckScannedReq) -> Result<Value> {
+    if req.ids.len() > 2000 {
+        bail!("单次查询最多 2000 条");
+    }
+    let app_clone = app.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<Value> {
+        let st = app_clone.state::<AppState>();
+        let c = st.db.lock().unwrap();
+        let thresh = req
+            .threshold
+            .unwrap_or_else(|| db::get_setting(&c, "threshold").and_then(|v| v.parse().ok()).unwrap_or(0.40));
+        let refs = match req.person_id {
+            Some(pid) => media::person_refs(&c, pid).unwrap_or_default(),
+            None => vec![],
+        };
+        let scanned_count: i64 = c.query_row("SELECT COUNT(*) FROM web_scans", [], |r| r.get(0))?;
+        let video_scanned_count: i64 =
+            c.query_row("SELECT COUNT(*) FROM media WHERE kind='video' AND status=1", [], |r| r.get(0))?;
+        let mut cache = st.web_cache.lock().unwrap();
+        let mut out = Vec::with_capacity(req.ids.len());
+        for raw_id in req.ids {
+            let key = normalize_item_id(&raw_id, "");
+            // 1. Check analyzed videos in `media` table
+            if let Some(mid) = find_analyzed_video_by_remote(&c, &key)? {
+                let vs = score_analyzed_video(&c, mid, req.person_id, &refs, thresh)?;
+                out.push(CheckScannedItem {
+                    id: raw_id,
+                    kind: "video".into(),
+                    scanned: true,
+                    cached: true,
+                    max_score: vs.max_score,
+                    face_count: vs.face_count,
+                    best_bbox: None,
+                    media_id: Some(vs.media_id),
+                    duration: vs.duration,
+                    segments: vs.segments,
+                });
+                continue;
+            }
+            // 2. Check persisted photo scans in L1 + `web_scans`
+            let faces_opt = if let Some(f) = cache.get(&key) {
+                Some(f.clone())
+            } else if let Some(f) = load_db_scan(&c, &key)? {
+                if cache.len() < MAX_CACHE_ENTRIES {
+                    cache.insert(key.clone(), f.clone());
+                }
+                Some(f)
+            } else {
+                None
+            };
+            match faces_opt {
+                Some(fs) => {
+                    let (max_score, best_bbox) = if refs.is_empty() { (0.0, None) } else { score_faces(&fs, &refs) };
+                    out.push(CheckScannedItem {
+                        id: raw_id,
+                        kind: "image".into(),
+                        scanned: true,
+                        cached: true,
+                        max_score,
+                        face_count: fs.len(),
+                        best_bbox,
+                        media_id: None,
+                        duration: None,
+                        segments: vec![],
+                    });
+                }
+                None => {
+                    out.push(CheckScannedItem {
+                        id: raw_id,
+                        kind: "unknown".into(),
+                        scanned: false,
+                        cached: false,
+                        max_score: 0.0,
+                        face_count: 0,
+                        best_bbox: None,
+                        media_id: None,
+                        duration: None,
+                        segments: vec![],
+                    });
+                }
+            }
+        }
+        Ok(json!({
+            "ok": true,
+            "scannedCount": scanned_count,
+            "videoScannedCount": video_scanned_count,
+            "results": out
         }))
     })
     .await?
@@ -239,6 +536,8 @@ struct MatchItem {
 struct MatchReq {
     person_id: i64,
     items: Vec<MatchItem>,
+    #[serde(default)]
+    force: bool,
 }
 
 #[derive(Serialize)]
@@ -246,13 +545,15 @@ struct MatchReq {
 struct MatchResult {
     id: String,
     url: String,
+    kind: String,
+    cached: bool,
     max_score: f32,
     face_count: usize,
     best_bbox: Option<[f32; 4]>,
     error: Option<String>,
 }
 
-fn is_allowed_image_url(url: &str) -> bool {
+fn is_allowed_media_url(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else { return false };
     if parsed.scheme() != "https" {
         return false;
@@ -271,72 +572,94 @@ async fn api_match_urls(app: &AppHandle, req: MatchReq) -> Result<Value> {
     if req.items.len() > 64 {
         bail!("单次批量最多 64 张图片");
     }
-    // Load person refs & ensure engine is ready.
+
     let app_init = app.clone();
     let pid = req.person_id;
-    let refs: Vec<Vec<f32>> = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<Vec<f32>>> {
-        let st = app_init.state::<AppState>();
-        media::ensure_engine(&st)?;
-        let c = st.db.lock().unwrap();
-        let refs = media::person_refs(&c, pid)?;
-        if refs.is_empty() {
-            bail!("该宝宝还没有录入参考照");
-        }
-        Ok(refs)
-    })
-    .await??;
+    let force = req.force;
+    let items_meta: Vec<(String, String, String)> = req
+        .items
+        .iter()
+        .map(|it| (it.id.clone(), it.url.clone(), normalize_item_id(&it.id, &it.url)))
+        .collect();
 
-    // Split into cached vs uncached items.
-    let mut cached_map: HashMap<String, CachedFaces> = HashMap::new();
-    let mut to_fetch: Vec<MatchItem> = vec![];
-    {
-        let st = app.state::<AppState>();
-        let cache = st.web_cache.lock().unwrap();
-        for it in &req.items {
-            if let Some(faces) = cache.get(&it.url) {
-                cached_map.insert(it.url.clone(), faces.clone());
-            } else if is_allowed_image_url(&it.url) {
-                to_fetch.push(MatchItem { id: it.id.clone(), url: it.url.clone() });
+    let (refs, mut cached_map, to_fetch): (Vec<Vec<f32>>, HashMap<String, CachedFaces>, Vec<(String, String)>) =
+        tauri::async_runtime::spawn_blocking(move || -> Result<_> {
+            let st = app_init.state::<AppState>();
+            let c = st.db.lock().unwrap();
+            let refs = media::person_refs(&c, pid)?;
+            if refs.is_empty() {
+                bail!("该宝宝还没有录入参考照");
             }
-        }
-    }
-
-    // Download uncached thumbnails concurrently (up to 6 at once).
-    let http = reqwest::Client::builder()
-        .user_agent("kid-finder")
-        .timeout(Duration::from_secs(20))
-        .build()?;
-    let downloaded: Vec<(String, Result<Vec<u8>>)> = stream::iter(to_fetch)
-        .map(|it| {
-            let http = http.clone();
-            async move {
-                let r = async {
-                    let resp = http.get(&it.url).send().await?.error_for_status()?;
-                    let bytes = resp.bytes().await?;
-                    if bytes.len() > 15 * 1024 * 1024 {
-                        bail!("图片过大");
+            let mut cached: HashMap<String, CachedFaces> = HashMap::new();
+            let mut missing: Vec<(String, String)> = vec![];
+            let mut mem = st.web_cache.lock().unwrap();
+            for (_id, url, key) in &items_meta {
+                if !force {
+                    if let Some(f) = mem.get(key) {
+                        cached.insert(key.clone(), f.clone());
+                        continue;
                     }
-                    Ok(bytes.to_vec())
+                    if let Some(f) = load_db_scan(&c, key)? {
+                        if mem.len() < MAX_CACHE_ENTRIES {
+                            mem.insert(key.clone(), f.clone());
+                        }
+                        cached.insert(key.clone(), f);
+                        continue;
+                    }
                 }
-                .await;
-                (it.url, r)
+                if is_allowed_media_url(url) {
+                    missing.push((key.clone(), url.clone()));
+                }
             }
+            drop(mem);
+            drop(c);
+            if !missing.is_empty() {
+                media::ensure_engine(&st)?;
+            }
+            Ok((refs, cached, missing))
         })
-        .buffer_unordered(6)
-        .collect()
-        .await;
+        .await??;
 
-    // Run ONNX inference on downloaded images and populate cache.
+    let was_cached_keys: std::collections::HashSet<String> = cached_map.keys().cloned().collect();
+
+    let downloaded: Vec<(String, Result<Vec<u8>>)> = if to_fetch.is_empty() {
+        vec![]
+    } else {
+        let http = reqwest::Client::builder()
+            .user_agent("kid-finder")
+            .timeout(Duration::from_secs(20))
+            .build()?;
+        stream::iter(to_fetch)
+            .map(|(key, url)| {
+                let http = http.clone();
+                async move {
+                    let r = async {
+                        let resp = http.get(&url).send().await?.error_for_status()?;
+                        let bytes = resp.bytes().await?;
+                        if bytes.len() > 15 * 1024 * 1024 {
+                            bail!("图片过大");
+                        }
+                        Ok(bytes.to_vec())
+                    }
+                    .await;
+                    (key, r)
+                }
+            })
+            .buffer_unordered(6)
+            .collect()
+            .await
+    };
+
     let app_inf = app.clone();
-    let (new_faces, errors): (HashMap<String, CachedFaces>, HashMap<String, String>) =
-        tauri::async_runtime::spawn_blocking(move || {
+    let (new_faces, errors, scanned_count): (HashMap<String, CachedFaces>, HashMap<String, String>, i64) =
+        tauri::async_runtime::spawn_blocking(move || -> Result<_> {
             let st = app_inf.state::<AppState>();
             let mut out_faces: HashMap<String, CachedFaces> = HashMap::new();
             let mut out_err: HashMap<String, String> = HashMap::new();
-            for (url, bytes_res) in downloaded {
+            for (key, bytes_res) in downloaded {
                 match bytes_res {
                     Err(e) => {
-                        out_err.insert(url, format!("{e:#}"));
+                        out_err.insert(key, format!("{e:#}"));
                     }
                     Ok(bytes) => {
                         let analyzed: Result<CachedFaces> = (|| {
@@ -356,15 +679,22 @@ async fn api_match_urls(app: &AppHandle, req: MatchReq) -> Result<Value> {
                         })();
                         match analyzed {
                             Ok(f) => {
-                                out_faces.insert(url, f);
+                                out_faces.insert(key, f);
                             }
                             Err(e) => {
-                                out_err.insert(url, format!("{e:#}"));
+                                out_err.insert(key, format!("{e:#}"));
                             }
                         }
                     }
                 }
             }
+            let total_scanned: i64 = {
+                let mut c = st.db.lock().unwrap();
+                if !out_faces.is_empty() {
+                    save_db_scans(&mut c, &out_faces)?;
+                }
+                c.query_row("SELECT COUNT(*) FROM web_scans", [], |r| r.get(0))?
+            };
             if !out_faces.is_empty() {
                 let mut cache = st.web_cache.lock().unwrap();
                 if cache.len() + out_faces.len() > MAX_CACHE_ENTRIES {
@@ -374,21 +704,24 @@ async fn api_match_urls(app: &AppHandle, req: MatchReq) -> Result<Value> {
                     cache.insert(k.clone(), v.clone());
                 }
             }
-            (out_faces, out_err)
+            Ok((out_faces, out_err, total_scanned))
         })
-        .await?;
+        .await??;
 
     for (k, v) in new_faces {
         cached_map.insert(k, v);
     }
 
-    // Score every requested item against the selected baby's reference embeddings.
     let mut results = Vec::with_capacity(req.items.len());
     for it in req.items {
-        if !is_allowed_image_url(&it.url) {
+        let key = normalize_item_id(&it.id, &it.url);
+        let cached = was_cached_keys.contains(&key);
+        if !cached && !is_allowed_media_url(&it.url) {
             results.push(MatchResult {
                 id: it.id,
                 url: it.url,
+                kind: "image".into(),
+                cached: false,
                 max_score: 0.0,
                 face_count: 0,
                 best_bbox: None,
@@ -396,10 +729,12 @@ async fn api_match_urls(app: &AppHandle, req: MatchReq) -> Result<Value> {
             });
             continue;
         }
-        if let Some(err) = errors.get(&it.url) {
+        if let Some(err) = errors.get(&key) {
             results.push(MatchResult {
                 id: it.id,
                 url: it.url,
+                kind: "image".into(),
+                cached: false,
                 max_score: 0.0,
                 face_count: 0,
                 best_bbox: None,
@@ -407,22 +742,14 @@ async fn api_match_urls(app: &AppHandle, req: MatchReq) -> Result<Value> {
             });
             continue;
         }
-        let faces = cached_map.get(&it.url);
-        let mut max_score = 0.0f32;
-        let mut best_bbox: Option<[f32; 4]> = None;
+        let faces = cached_map.get(&key);
         let face_count = faces.map(|f| f.len()).unwrap_or(0);
-        if let Some(fs) = faces {
-            for (bbox, emb) in fs {
-                let sim = refs.iter().map(|q| face::cosine(q, emb)).fold(f32::MIN, f32::max);
-                if sim > max_score {
-                    max_score = sim;
-                    best_bbox = Some(*bbox);
-                }
-            }
-        }
+        let (max_score, best_bbox) = faces.map(|fs| score_faces(fs, &refs)).unwrap_or((0.0, None));
         results.push(MatchResult {
             id: it.id,
             url: it.url,
+            kind: "image".into(),
+            cached,
             max_score,
             face_count,
             best_bbox,
@@ -430,7 +757,317 @@ async fn api_match_urls(app: &AppHandle, req: MatchReq) -> Result<Value> {
         });
     }
 
-    Ok(json!({ "ok": true, "results": results }))
+    Ok(json!({ "ok": true, "scannedCount": scanned_count, "results": results }))
+}
+
+// ---------------- video download, 1fps analysis & auto-clip export ----------------
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AnalyzeVideoReq {
+    person_id: i64,
+    id: String,
+    url: String,
+    threshold: Option<f32>,
+}
+
+/// Downloads a qxc.hi.cn video into the local library (if not already present), runs full 1fps
+/// ffmpeg + ONNX face analysis, persists results in `media` / `faces`, and returns matching segments.
+async fn api_analyze_video(app: &AppHandle, req: AnalyzeVideoReq) -> Result<Value> {
+    let key = normalize_item_id(&req.id, &req.url);
+    let raw_url = req.url.split('?').next().unwrap_or(&req.url).to_string();
+    if !is_allowed_media_url(&raw_url) {
+        bail!("不支持的视频来源");
+    }
+
+    // 1. Check if this video has already been analyzed before (0 download, 0 inference!).
+    let app_check = app.clone();
+    let key_check = key.clone();
+    let pid = req.person_id;
+    let req_thresh = req.threshold;
+    let pre = tauri::async_runtime::spawn_blocking(move || -> Result<(Vec<Vec<f32>>, f32, Option<VideoScore>, Option<PathBuf>)> {
+        let st = app_check.state::<AppState>();
+        let c = st.db.lock().unwrap();
+        let refs = media::person_refs(&c, pid)?;
+        if refs.is_empty() {
+            bail!("该宝宝还没有录入参考照");
+        }
+        let thresh = req_thresh
+            .unwrap_or_else(|| db::get_setting(&c, "threshold").and_then(|v| v.parse().ok()).unwrap_or(0.40));
+        if let Some(mid) = find_analyzed_video_by_remote(&c, &key_check)? {
+            let vs = score_analyzed_video(&c, mid, Some(pid), &refs, thresh)?;
+            return Ok((refs, thresh, Some(vs), None));
+        }
+        drop(c);
+        media::ensure_engine(&st)?;
+        let ff = download::find_ffmpeg(&st)
+            .ok_or_else(|| anyhow!("处理视频需要 ffmpeg，请先在桌面端「设置」点「自动安装」"))?;
+        Ok((refs, thresh, None, Some(ff)))
+    })
+    .await??;
+
+    let (refs, thresh, cached_score, ffmpeg_path) = pre;
+    if let Some(vs) = cached_score {
+        let app_cnt = app.clone();
+        let video_count: i64 = tauri::async_runtime::spawn_blocking(move || -> Result<i64> {
+            Ok(app_cnt
+                .state::<AppState>()
+                .db
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM media WHERE kind='video' AND status=1", [], |r| r.get(0))?)
+        })
+        .await??;
+        return Ok(json!({
+            "ok": true,
+            "id": req.id,
+            "kind": "video",
+            "cached": true,
+            "mediaId": vs.media_id,
+            "maxScore": vs.max_score,
+            "faceCount": vs.face_count,
+            "duration": vs.duration,
+            "segments": vs.segments,
+            "videoScannedCount": video_count,
+        }));
+    }
+
+    let ff = ffmpeg_path.ok_or_else(|| anyhow!("缺少 ffmpeg"))?;
+
+    // 2. Stream-download the full MP4 into st.paths.tmp.
+    let tmp_path = {
+        let st = app.state::<AppState>();
+        let name = raw_url.rsplit('/').next().unwrap_or("video.mp4");
+        let ext = Path::new(name).extension().and_then(|e| e.to_str()).unwrap_or("mp4");
+        st.paths.tmp.join(format!("ext_vid_{}.{ext}", uuid::Uuid::new_v4()))
+    };
+    let http = reqwest::Client::builder()
+        .user_agent("kid-finder")
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(300))
+        .build()?;
+    let resp = http.get(&raw_url).send().await?.error_for_status()?;
+    if let Some(len) = resp.content_length() {
+        if len > MAX_VIDEO_BYTES {
+            bail!("视频超过 500MB，已跳过");
+        }
+    }
+    let mut file = tokio::fs::File::create(&tmp_path).await?;
+    let mut downloaded_len: u64 = 0;
+    let mut body_stream = resp.bytes_stream();
+    while let Some(chunk) = body_stream.next().await {
+        let chunk = chunk?;
+        downloaded_len += chunk.len() as u64;
+        if downloaded_len > MAX_VIDEO_BYTES {
+            drop(file);
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            bail!("视频超过 500MB，已跳过");
+        }
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    drop(file);
+
+    // 3. Deduplicate by sha256, store in library, analyze at 1fps, save faces in SQLite, score.
+    let app_run = app.clone();
+    let orig_name = raw_url.rsplit('/').next().unwrap_or("video.mp4").to_string();
+    let tmp_for_cleanup = tmp_path.clone();
+    let out = tauri::async_runtime::spawn_blocking(move || -> Result<(VideoScore, bool, i64)> {
+        let st = app_run.state::<AppState>();
+        let sha = media::sha256_file(&tmp_path)?;
+        let existing: Option<(i64, String, i64)> = st
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT id, path, status FROM media WHERE sha256=?1", [&sha], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?;
+
+        let (media_id, stored_path, already_done) = if let Some((id, path, status)) = existing {
+            let _ = std::fs::remove_file(&tmp_path);
+            st.db.lock().unwrap().execute(
+                "UPDATE media SET remote_id=COALESCE(remote_id, ?1) WHERE id=?2",
+                params![key, id],
+            )?;
+            (id, path, status == 1)
+        } else {
+            let id = media::store_file(
+                &st,
+                media::NewMedia {
+                    src: &tmp_path,
+                    sha: &sha,
+                    kind: "video",
+                    orig_name: &orig_name,
+                    source: "qxc-ext",
+                    remote_id: Some(&key),
+                    remote_time: None,
+                    move_file: true,
+                },
+            )?;
+            let path: String = st
+                .db
+                .lock()
+                .unwrap()
+                .query_row("SELECT path FROM media WHERE id=?1", [id], |r| r.get(0))?;
+            (id, path, false)
+        };
+
+        if !already_done {
+            let res = media::analyze_video(&st, Some(&ff), media_id, Path::new(&stored_path));
+            let mut c = st.db.lock().unwrap();
+            match res {
+                Ok((rows, poster, duration)) => {
+                    let tx = c.transaction()?;
+                    tx.execute("DELETE FROM faces WHERE media_id=?1", [media_id])?;
+                    for (t, b, s, e) in rows {
+                        tx.execute(
+                            "INSERT INTO faces(media_id,t,x1,y1,x2,y2,score,embedding) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                            params![media_id, t, b[0], b[1], b[2], b[3], s, db::emb_to_blob(&e)],
+                        )?;
+                    }
+                    tx.execute(
+                        "UPDATE media SET status=1, error=NULL, poster=COALESCE(?2,poster), duration=COALESCE(?3,duration) WHERE id=?1",
+                        params![media_id, poster, duration],
+                    )?;
+                    tx.commit()?;
+                }
+                Err(e) => {
+                    c.execute("UPDATE media SET status=2, error=?2 WHERE id=?1", params![media_id, format!("{e:#}")])?;
+                    return Err(e);
+                }
+            }
+        }
+
+        let c = st.db.lock().unwrap();
+        let vs = score_analyzed_video(&c, media_id, Some(pid), &refs, thresh)?;
+        let video_count: i64 = c.query_row("SELECT COUNT(*) FROM media WHERE kind='video' AND status=1", [], |r| r.get(0))?;
+        let _ = app_run.emit("process-done", Option::<String>::None);
+        Ok((vs, already_done, video_count))
+    })
+    .await;
+
+    let _ = tokio::fs::remove_file(&tmp_for_cleanup).await;
+    let (vs, was_cached, video_count) = out??;
+
+    Ok(json!({
+        "ok": true,
+        "id": req.id,
+        "kind": "video",
+        "cached": was_cached,
+        "mediaId": vs.media_id,
+        "maxScore": vs.max_score,
+        "faceCount": vs.face_count,
+        "duration": vs.duration,
+        "segments": vs.segments,
+        "videoScannedCount": video_count,
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportClipsReq {
+    person_id: i64,
+    threshold: Option<f32>,
+    media_ids: Vec<i64>,
+    lead: Option<f64>,
+    tail: Option<f64>,
+    fade: Option<f64>,
+    #[serde(default)]
+    open_folder: bool,
+}
+
+/// Automatically crops matched videos to baby-only clips using ffmpeg (with lead/tail padding & fade)
+/// and writes them into `<Downloads>/找娃助手导出/<宝宝名>/`.
+async fn api_export_clips(app: &AppHandle, req: ExportClipsReq) -> Result<Value> {
+    if req.media_ids.is_empty() {
+        bail!("没有需要裁剪的视频");
+    }
+    let lead = req.lead.unwrap_or(2.0).clamp(0.0, 30.0);
+    let tail = req.tail.unwrap_or(2.0).clamp(0.0, 30.0);
+    let fade = req.fade.unwrap_or(0.5).clamp(0.0, 3.0);
+    let app_clone = app.clone();
+
+    let (out_dir, rep) = tauri::async_runtime::spawn_blocking(move || -> Result<(PathBuf, media::ExportReport)> {
+        let st = app_clone.state::<AppState>();
+        let (person_name, refs, thresh, items) = {
+            let c = st.db.lock().unwrap();
+            let pname: String = c
+                .query_row("SELECT name FROM persons WHERE id=?1", [req.person_id], |r| r.get(0))
+                .unwrap_or_else(|_| "宝宝".into());
+            let refs = media::person_refs(&c, req.person_id)?;
+            if refs.is_empty() {
+                bail!("该宝宝还没有录入参考照");
+            }
+            let thresh = req
+                .threshold
+                .unwrap_or_else(|| db::get_setting(&c, "threshold").and_then(|v| v.parse().ok()).unwrap_or(0.40));
+            let mut export_items = Vec::new();
+            for mid in &req.media_ids {
+                let vs = score_analyzed_video(&c, *mid, Some(req.person_id), &refs, thresh)?;
+                if vs.segments.is_empty() {
+                    continue;
+                }
+                let padded = media::pad_segments(&vs.segments, lead, tail, vs.duration);
+                export_items.push(media::ExportItem { media_id: *mid, segments: padded });
+            }
+            (pname, refs, thresh, export_items)
+        };
+        let _ = (refs, thresh);
+        if items.is_empty() {
+            bail!("选中的视频在当前严格程度下没有命中宝宝片段");
+        }
+        let out_dir = default_export_root(&app_clone).join(safe_folder_name(&person_name));
+        let rep = media::export(&app_clone, &out_dir, items, fade)?;
+        Ok((out_dir, rep))
+    })
+    .await??;
+
+    if req.open_folder && (rep.clips > 0 || rep.skipped > 0) {
+        let _ = app.opener().open_path(out_dir.to_string_lossy().to_string(), None::<&str>);
+    }
+
+    Ok(json!({
+        "ok": true,
+        "outDir": out_dir.to_string_lossy(),
+        "clips": rep.clips,
+        "skipped": rep.skipped,
+        "errors": rep.errors,
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenExportDirReq {
+    person_id: Option<i64>,
+}
+
+async fn api_open_export_dir(app: &AppHandle, req: OpenExportDirReq) -> Result<Value> {
+    let root = default_export_root(app);
+    let dir = if let Some(pid) = req.person_id {
+        let app_c = app.clone();
+        let pname: Option<String> = tauri::async_runtime::spawn_blocking(move || {
+            app_c
+                .state::<AppState>()
+                .db
+                .lock()
+                .unwrap()
+                .query_row("SELECT name FROM persons WHERE id=?1", [pid], |r| r.get(0))
+                .ok()
+        })
+        .await?;
+        match pname {
+            Some(n) => root.join(safe_folder_name(&n)),
+            None => root,
+        }
+    } else {
+        root
+    };
+    std::fs::create_dir_all(&dir)?;
+    app.opener()
+        .open_path(dir.to_string_lossy().to_string(), None::<&str>)
+        .map_err(|e| anyhow!("{e}"))?;
+    Ok(json!({ "ok": true, "outDir": dir.to_string_lossy() }))
 }
 
 #[derive(Deserialize)]
@@ -518,19 +1155,35 @@ async fn api_threshold(app: &AppHandle, value: f32) -> Result<Value> {
     Ok(json!({ "ok": true, "threshold": clamped }))
 }
 
+pub fn clear_web_cache_sync(st: &AppState) -> Result<()> {
+    st.db.lock().unwrap().execute("DELETE FROM web_scans", [])?;
+    st.web_cache.lock().unwrap().clear();
+    Ok(())
+}
+
+async fn api_clear_web_cache(app: &AppHandle) -> Result<Value> {
+    let app_clone = app.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<()> {
+        clear_web_cache_sync(&app_clone.state::<AppState>())
+    })
+    .await??;
+    Ok(json!({ "ok": true, "scannedCount": 0 }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn url_allowlist_checks_scheme_and_host() {
-        assert!(is_allowed_image_url("https://releasec.qxc.hi.cn/medias/abc/1.jpg?imageMogr2/thumbnail/960x/format/jpg"));
-        assert!(is_allowed_image_url("https://foo.tcb.qcloud.la/a.jpg"));
-        assert!(is_allowed_image_url("https://bucket.cos.ap-shanghai.myqcloud.com/a.jpg"));
-        assert!(!is_allowed_image_url("http://releasec.qxc.hi.cn/medias/abc/1.jpg"));
-        assert!(!is_allowed_image_url("http://127.0.0.1:27431/api/status"));
-        assert!(!is_allowed_image_url("https://evil.example.com/qxc.hi.cn.jpg"));
-        assert!(!is_allowed_image_url("file:///etc/passwd"));
+        assert!(is_allowed_media_url("https://releasec.qxc.hi.cn/medias/abc/1.jpg?imageMogr2/thumbnail/960x/format/jpg"));
+        assert!(is_allowed_media_url("https://releasec.qxc.hi.cn/medias/abc/1.mp4"));
+        assert!(is_allowed_media_url("https://foo.tcb.qcloud.la/a.jpg"));
+        assert!(is_allowed_media_url("https://bucket.cos.ap-shanghai.myqcloud.com/a.jpg"));
+        assert!(!is_allowed_media_url("http://releasec.qxc.hi.cn/medias/abc/1.jpg"));
+        assert!(!is_allowed_media_url("http://127.0.0.1:27431/api/status"));
+        assert!(!is_allowed_media_url("https://evil.example.com/qxc.hi.cn.jpg"));
+        assert!(!is_allowed_media_url("file:///etc/passwd"));
     }
 
     #[test]
@@ -539,5 +1192,38 @@ mod tests {
         assert_eq!(allowed_origin(Some("https://qxc.hi.cn")), Some("https://qxc.hi.cn"));
         assert_eq!(allowed_origin(Some("https://evil.com")), None);
         assert_eq!(allowed_origin(None), None);
+    }
+
+    #[test]
+    fn persistent_web_scan_cache_roundtrip() {
+        let tmp = std::env::temp_dir().join(format!("kid_finder_db_test_{}.db", uuid::Uuid::new_v4()));
+        let mut conn = db::open(&tmp).unwrap();
+        let id_with_face = "https://releasec.qxc.hi.cn/medias/g1/p1_s.jpg";
+        let id_no_face = "https://releasec.qxc.hi.cn/medias/g1/p2_s.jpg";
+
+        assert!(load_db_scan(&conn, id_with_face).unwrap().is_none());
+        let mut entries = HashMap::new();
+        entries.insert(id_with_face.to_string(), vec![([0.1, 0.2, 0.3, 0.4], vec![0.6, 0.8])]);
+        entries.insert(id_no_face.to_string(), vec![]);
+        save_db_scans(&mut conn, &entries).unwrap();
+
+        let loaded = load_db_scan(&conn, id_with_face).unwrap().expect("should exist");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].0, [0.1, 0.2, 0.3, 0.4]);
+        let (sim, bbox) = score_faces(&loaded, &[vec![0.6, 0.8]]);
+        assert!((sim - 1.0).abs() < 1e-5);
+        assert_eq!(bbox, Some([0.1, 0.2, 0.3, 0.4]));
+
+        let empty = load_db_scan(&conn, id_no_face).unwrap().expect("0-face scan should still be cached");
+        assert!(empty.is_empty());
+
+        drop(conn);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn pad_segments_merges_overlaps_and_clamps() {
+        let merged = media::pad_segments(&[[1.0, 3.0], [5.0, 8.0], [20.0, 22.0]], 2.0, 2.0, Some(22.0));
+        assert_eq!(merged, vec![[0.0, 10.0], [18.0, 23.0]]);
     }
 }

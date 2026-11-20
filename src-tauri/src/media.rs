@@ -266,7 +266,7 @@ fn run(mut c: Command) -> Result<()> {
     Ok(())
 }
 
-fn analyze_video(st: &AppState, ffmpeg: Option<&Path>, id: i64, path: &Path) -> Result<(Vec<FaceRow>, Option<String>, Option<f64>)> {
+pub fn analyze_video(st: &AppState, ffmpeg: Option<&Path>, id: i64, path: &Path) -> Result<(Vec<FaceRow>, Option<String>, Option<f64>)> {
     let ff = ffmpeg.ok_or_else(|| anyhow!("未找到 ffmpeg，无法处理视频（请在「设置」页安装）"))?;
     let dir = st.paths.tmp.join(format!("v{id}"));
     let _ = std::fs::remove_dir_all(&dir);
@@ -381,7 +381,7 @@ pub fn search(c: &Connection, person_id: i64, threshold: f32) -> Result<Vec<Hit>
 
 /// Turn the sampled timestamps (1 fps) where the kid appears into merged clips.
 /// No lead-in/tail padding here: the UI applies the user's 提前/延后 settings.
-fn merge_segments(mut times: Vec<f64>, duration: Option<f64>) -> Vec<[f64; 2]> {
+pub fn merge_segments(mut times: Vec<f64>, duration: Option<f64>) -> Vec<[f64; 2]> {
     const GAP: f64 = 3.0;
     times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     times.dedup();
@@ -394,6 +394,25 @@ fn merge_segments(mut times: Vec<f64>, duration: Option<f64>) -> Vec<[f64; 2]> {
     }
     let end_max = duration.map(|d| d + 1.0).unwrap_or(f64::MAX);
     segs.into_iter().map(|[a, b]| [a, (b + 1.0).min(end_max)]).collect()
+}
+
+/// Apply lead-in / tail padding, clamp to video duration, and merge overlaps.
+pub fn pad_segments(segs: &[[f64; 2]], lead: f64, tail: f64, duration: Option<f64>) -> Vec<[f64; 2]> {
+    let max = duration.map(|d| d + 1.0).unwrap_or(f64::INFINITY);
+    let mut sorted = segs.to_vec();
+    sorted.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap_or(std::cmp::Ordering::Equal));
+    let mut out: Vec<[f64; 2]> = vec![];
+    for [a, b] in sorted {
+        let p = [(a - lead).max(0.0), (b + tail).min(max)];
+        if let Some(last) = out.last_mut() {
+            if p[0] <= last[1] {
+                last[1] = last[1].max(p[1]);
+                continue;
+            }
+        }
+        out.push(p);
+    }
+    out
 }
 
 // ---------------- export ----------------

@@ -20,7 +20,8 @@ async function init() {
     : "尚未录入宝宝，可在桌面端或群相册网页浮窗中录入。";
   el.innerHTML = `
     <div class="ok">已连接桌面端 v${d.version || ""}</div>
-    <div class="muted" style="margin-top:4px;">${d.modelsReady ? "人脸模型已就绪" : "请先在桌面端「设置」下载模型"}</div>
+    <div class="muted" style="margin-top:4px;">${d.modelsReady ? "人脸模型已就绪" : "请先在桌面端「设置」下载模型"} · ${d.ffmpegReady ? "ffmpeg 已就绪" : "未装 ffmpeg"}</div>
+    <div class="muted" style="margin-top:4px;">已缓存：照片 ${d.scannedCount ?? 0} 张 · 视频 ${d.videoScannedCount ?? 0} 个</div>
     <div class="muted" style="margin-top:4px;">${kidText}</div>
   `;
 }

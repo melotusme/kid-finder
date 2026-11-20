@@ -80,6 +80,7 @@ struct Status {
     bridge_running: bool,
     bridge_port: u16,
     extension_dir: String,
+    web_scanned: i64,
 }
 
 #[tauri::command]
@@ -105,6 +106,7 @@ async fn get_status(app: AppHandle) -> CmdResult<Status> {
             bridge_running: st.bridge_running.load(Ordering::SeqCst),
             bridge_port: bridge::BRIDGE_PORT,
             extension_dir: extension::extension_dir(&st.paths).to_string_lossy().to_string(),
+            web_scanned: n("SELECT COUNT(*) FROM web_scans")?,
         })
     })
     .await
@@ -395,6 +397,11 @@ fn open_qxc_web(app: AppHandle) -> CmdResult<()> {
     app.opener().open_url("https://qxc.hi.cn/#/", None::<&str>).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn clear_web_cache(app: AppHandle) -> CmdResult<()> {
+    blocking(move || bridge::clear_web_cache_sync(&app.state::<AppState>())).await
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -445,6 +452,7 @@ pub fn run() {
             qxc_sync,
             install_chrome_extension,
             open_qxc_web,
+            clear_web_cache,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

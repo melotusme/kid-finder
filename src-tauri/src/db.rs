@@ -36,6 +36,15 @@ pub fn open(path: &Path) -> Result<Connection> {
             face_id INTEGER NOT NULL, person_id INTEGER NOT NULL,
             PRIMARY KEY(face_id, person_id));
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS web_scans(
+            item_id TEXT PRIMARY KEY,
+            scanned_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS web_faces(
+            id INTEGER PRIMARY KEY,
+            item_id TEXT NOT NULL REFERENCES web_scans(item_id) ON DELETE CASCADE,
+            x1 REAL NOT NULL, y1 REAL NOT NULL, x2 REAL NOT NULL, y2 REAL NOT NULL,
+            embedding BLOB NOT NULL);
+        CREATE INDEX IF NOT EXISTS web_faces_item ON web_faces(item_id);
         "#,
     )?;
     Ok(c)

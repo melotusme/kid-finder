@@ -339,7 +339,7 @@ function Import({
         </div>
       </div>
       {report && <ImportResult r={report} />}
-      <ChromeExtensionCard status={status} persons={persons} onInstallExt={onInstallExt} notify={notify} />
+      <ChromeExtensionCard status={status} persons={persons} onInstallExt={onInstallExt} refresh={refresh} notify={notify} />
       <Qxc status={status} refresh={refresh} notify={notify} />
     </section>
   );
@@ -750,7 +750,7 @@ function Settings({
         </div>
         <p className="hint">首次使用需要下载 InsightFace 开源模型，所有识别都在本机完成，照片不会上传。</p>
       </div>
-      <ChromeExtensionCard status={status} persons={persons} onInstallExt={onInstallExt} notify={notify} />
+      <ChromeExtensionCard status={status} persons={persons} onInstallExt={onInstallExt} refresh={refresh} notify={notify} />
       <div className="card">
         <div className="row">
           <h3>ffmpeg（处理视频用）</h3>
@@ -808,11 +808,13 @@ function ChromeExtensionCard({
   status,
   persons,
   onInstallExt,
+  refresh,
   notify,
 }: {
   status: Status;
   persons: Person[];
   onInstallExt: () => void;
+  refresh: () => Promise<void>;
   notify: (m: string) => void;
 }) {
   const readyKids = persons.filter((p) => p.refs.length > 0);
@@ -824,22 +826,40 @@ function ChromeExtensionCard({
           {status.bridgeRunning ? `本地服务已就绪 (127.0.0.1:${status.bridgePort})` : "本地服务未启动"}
         </span>
         <div className="spacer" />
-        <button onClick={onInstallExt}>一键安装 Chrome 扩展</button>
+        <button onClick={onInstallExt}>一键安装 / 更新扩展</button>
         <button className="ghost" onClick={() => api.openQxcWeb().catch((e) => notify(String(e)))}>
           打开群相册网页
         </button>
       </div>
       <p className="hint" style={{ marginBottom: 4 }}>
-        不想把几百上千张照片全下到本地？装上扩展后，在 <b>qxc.hi.cn</b> 网页里点一下即可调用本机模型扫描缩略图，自动勾选自家宝宝的照片。
+        不想把几百上千张照片全下到本地？装上扩展后，在 <b>qxc.hi.cn</b> 网页里支持<b>增量扫新增</b>与<b>存量补扫</b>，扫过的照片特征会持久化保存在本机数据库，以后自动跳过不重复扫描。
       </p>
-      <div className="small muted">
+      <div className="row small muted">
         {readyKids.length > 0 ? (
-          <>
-            已自动同步宝宝：<b style={{ color: "#2e7d32" }}>{readyKids.map((p) => `${p.name}（${p.refs.length} 张）`).join("、")}</b>
-            ，装好扩展后无需再次上传宝宝照片。
-          </>
+          <span>
+            已同步宝宝：<b style={{ color: "#2e7d32" }}>{readyKids.map((p) => `${p.name}（${p.refs.length} 张）`).join("、")}</b>
+            ，网页端无需再次上传
+          </span>
         ) : (
-          <>提示：先在「① 录入宝宝」添加正脸照，装好扩展后会自动同步到网页端。</>
+          <span>提示：先在「① 录入宝宝」添加正脸照，装好扩展后会自动同步到网页端</span>
+        )}
+        <span>· 已缓存网页照片 {status.webScanned} 张</span>
+        {status.webScanned > 0 && (
+          <a
+            onClick={() => {
+              if (confirm(`清空 ${status.webScanned} 张网页扫描缓存？下次打开群相册会重新识别这些照片。`)) {
+                api
+                  .clearWebCache()
+                  .then(() => {
+                    notify("已清空网页扫描缓存");
+                    refresh();
+                  })
+                  .catch((e) => notify(String(e)));
+              }
+            }}
+          >
+            清空缓存
+          </a>
         )}
       </div>
     </div>

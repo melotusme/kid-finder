@@ -314,6 +314,47 @@
   font-size: 13px;
 }
 
+.kf-stat-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  padding: 6px 8px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+}
+
+.kf-pill-mini {
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.kf-pill-mini.new {
+  background: #ffedd5;
+  color: #c2410c;
+}
+
+.kf-pill-mini.old {
+  background: #e2e8f0;
+  color: #475569;
+}
+
+.kf-type-box {
+  padding: 8px 10px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+}
+
+.kf-video-opts {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed #cbd5e1;
+}
+
 /* 页面照片卡片上的标注 */
 .imgItem {
   position: relative;
@@ -322,6 +363,12 @@
 .imgItem.kf-matched {
   outline: 3px solid #f59e0b !important;
   outline-offset: -3px;
+  border-radius: 8px;
+}
+
+.imgItem.kf-matched-old {
+  outline: 2px dashed #10b981 !important;
+  outline-offset: -2px;
   border-radius: 8px;
 }
 
@@ -349,6 +396,10 @@ body.kf-only-matched .imgItem.kf-unmatched:hover {
   color: #fff;
   background: rgba(234, 88, 12, 0.92);
   box-shadow: 0 2px 6px rgba(0, 0, 0, 0.28);
+}
+
+.kf-tile-badge.old-hit {
+  background: rgba(16, 185, 129, 0.9);
 }
 
 .kf-tile-badge.miss {

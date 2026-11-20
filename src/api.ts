@@ -15,6 +15,7 @@ export type Status = {
   bridgeRunning: boolean;
   bridgePort: number;
   extensionDir: string;
+  webScanned: number;
 };
 export type ExtensionInstallResult = {
   dir: string;
@@ -75,6 +76,7 @@ export const api = {
   qxcSync: (groupId: string) => invoke<SyncReport>("qxc_sync", { groupId }),
   installChromeExtension: () => invoke<ExtensionInstallResult>("install_chrome_extension"),
   openQxcWeb: () => invoke<void>("open_qxc_web"),
+  clearWebCache: () => invoke<void>("clear_web_cache"),
 };
 
 export const src = (p: string | null | undefined) => (p ? convertFileSrc(p) : "");
