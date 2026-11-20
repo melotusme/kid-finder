@@ -50,3 +50,10 @@ a { color: #e08a00; cursor: pointer; }
 .seg { gap: 6px; } .seg button { padding: 3px 10px; }
 input.time { width: 78px; text-align: center; font-variant-numeric: tabular-nums; }
 .cliprow { gap: 18px; margin-top: 0; } .cliprow input { width: 64px; margin: 0 6px; }
+nav button.ext-nav-btn { background: #fff7ed; color: #c2410c; border: 1px solid #fed7aa; font-weight: 600; text-align: center; margin-bottom: 6px; }
+nav button.ext-nav-btn:hover { background: #ffedd5; }
+.ext-card { border: 1px solid #fde6c4; background: linear-gradient(180deg, #fffdf9, #ffffff); }
+.ext-modal { width: 540px; max-width: 92vw; padding: 18px 20px !important; gap: 12px !important; }
+.ext-status-list { display: grid; gap: 4px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px 12px; font-size: 13px; }
+.ext-steps { margin: 0; padding-left: 20px; display: grid; gap: 8px; line-height: 1.6; }
+.ext-path { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; color: #555; background: #f3f4f6; padding: 8px 10px; border-radius: 6px; word-break: break-all; user-select: all; }

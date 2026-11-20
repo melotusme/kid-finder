@@ -1,5 +1,7 @@
+mod bridge;
 mod db;
 mod download;
+mod extension;
 mod face;
 mod media;
 mod qxc;
@@ -7,10 +9,12 @@ mod qxc;
 use anyhow::{anyhow, Result};
 use rusqlite::{params, Connection};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::{AppHandle, Manager};
+use tauri_plugin_opener::OpenerExt;
 
 pub struct Paths {
     pub data: PathBuf,
@@ -43,6 +47,8 @@ pub struct AppState {
     pub db: Mutex<Connection>,
     pub engine: Mutex<Option<face::FaceEngine>>,
     pub processing: AtomicBool,
+    pub bridge_running: AtomicBool,
+    pub web_cache: Mutex<HashMap<String, bridge::CachedFaces>>,
 }
 
 type CmdResult<T> = std::result::Result<T, String>;
@@ -71,6 +77,9 @@ struct Status {
     qxc_user: Option<String>,
     threshold: f32,
     data_dir: String,
+    bridge_running: bool,
+    bridge_port: u16,
+    extension_dir: String,
 }
 
 #[tauri::command]
@@ -93,6 +102,9 @@ async fn get_status(app: AppHandle) -> CmdResult<Status> {
             qxc_user,
             threshold: threshold(&c),
             data_dir: st.paths.data.to_string_lossy().to_string(),
+            bridge_running: st.bridge_running.load(Ordering::SeqCst),
+            bridge_port: bridge::BRIDGE_PORT,
+            extension_dir: extension::extension_dir(&st.paths).to_string_lossy().to_string(),
         })
     })
     .await
@@ -366,6 +378,23 @@ async fn qxc_sync(app: AppHandle, group_id: String) -> CmdResult<qxc::SyncReport
     Ok(rep)
 }
 
+// ---------------- Chrome 扩展安装入口 ----------------
+
+#[tauri::command]
+async fn install_chrome_extension(app: AppHandle) -> CmdResult<extension::InstallResult> {
+    blocking(move || {
+        let st = app.state::<AppState>();
+        let dir = extension::extract(&st.paths)?;
+        Ok(extension::open_install_helpers(&dir))
+    })
+    .await
+}
+
+#[tauri::command]
+fn open_qxc_web(app: AppHandle) -> CmdResult<()> {
+    app.opener().open_url("https://qxc.hi.cn/#/", None::<&str>).map_err(|e| e.to_string())
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -379,7 +408,16 @@ pub fn run() {
             // A crash mid-way may leave partial temp files behind.
             let _ = std::fs::remove_dir_all(&paths.tmp);
             std::fs::create_dir_all(&paths.tmp)?;
-            app.manage(AppState { paths, db: Mutex::new(conn), engine: Mutex::new(None), processing: AtomicBool::new(false) });
+            let _ = extension::extract(&paths);
+            app.manage(AppState {
+                paths,
+                db: Mutex::new(conn),
+                engine: Mutex::new(None),
+                processing: AtomicBool::new(false),
+                bridge_running: AtomicBool::new(false),
+                web_cache: Mutex::new(HashMap::new()),
+            });
+            bridge::start(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -405,6 +443,8 @@ pub fn run() {
             qxc_logout,
             qxc_albums,
             qxc_sync,
+            install_chrome_extension,
+            open_qxc_web,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

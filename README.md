@@ -4,6 +4,7 @@
 
 - 人脸识别全部在本机完成（InsightFace 开源模型 + ONNX Runtime），照片不会上传
 - 支持 Windows / macOS（Apple Silicon）
+- 内置 **Chrome 扩展**，可在群相册网页版（`qxc.hi.cn`）直接调用本机模型扫描缩略图并自动勾选自家宝宝的照片，复用桌面端已录入的宝宝参考照，无需全量下载原图
 - 自动更新
 
 ## 使用

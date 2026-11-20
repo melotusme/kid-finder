@@ -12,6 +12,15 @@ export type Status = {
   qxcUser: string | null;
   threshold: number;
   dataDir: string;
+  bridgeRunning: boolean;
+  bridgePort: number;
+  extensionDir: string;
+};
+export type ExtensionInstallResult = {
+  dir: string;
+  browser: string | null;
+  openedBrowser: boolean;
+  openedFolder: boolean;
 };
 export type Person = { id: number; name: string; refs: { id: number; thumb: string | null }[] };
 export type ImportReport = {
@@ -64,6 +73,8 @@ export const api = {
   qxcLogout: () => invoke<void>("qxc_logout"),
   qxcAlbums: () => invoke<Album[]>("qxc_albums"),
   qxcSync: (groupId: string) => invoke<SyncReport>("qxc_sync", { groupId }),
+  installChromeExtension: () => invoke<ExtensionInstallResult>("install_chrome_extension"),
+  openQxcWeb: () => invoke<void>("open_qxc_web"),
 };
 
 export const src = (p: string | null | undefined) => (p ? convertFileSrc(p) : "");

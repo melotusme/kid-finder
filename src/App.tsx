@@ -5,7 +5,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
-import { api, src, fmtTime, parseTime, padSegments, loadClipSettings, saveClipSettings, type ClipSettings, type Status, type Person, type Hit, type Progress, type ImportReport, type Album, type LoginTicket } from "./api";
+import { api, src, fmtTime, parseTime, padSegments, loadClipSettings, saveClipSettings, type ClipSettings, type Status, type Person, type Hit, type Progress, type ImportReport, type Album, type LoginTicket, type ExtensionInstallResult } from "./api";
 
 type Tab = "kids" | "import" | "results" | "settings";
 const MEDIA_EXT = ["jpg", "jpeg", "png", "webp", "bmp", "gif", "mp4", "mov", "m4v", "avi", "mkv", "3gp", "webm"];
@@ -18,6 +18,7 @@ export default function App() {
   const [dl, setDl] = useState<{ label: string; done: number; total: number | null } | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [update, setUpdate] = useState<Update | null>(null);
+  const [extGuide, setExtGuide] = useState<ExtensionInstallResult | null>(null);
 
   const refresh = useCallback(async () => {
     const [s, p] = await Promise.all([api.status(), api.persons()]);
@@ -28,6 +29,17 @@ export default function App() {
     setToast(m);
     setTimeout(() => setToast((t) => (t === m ? null : t)), 6000);
   };
+
+  const triggerInstallExtension = useCallback(async () => {
+    try {
+      const res = await api.installChromeExtension();
+      navigator.clipboard?.writeText(res.dir).catch(() => {});
+      setExtGuide(res);
+      refresh();
+    } catch (e) {
+      notify("准备 Chrome 扩展失败：" + String(e));
+    }
+  }, [refresh]);
 
   useEffect(() => {
     refresh();
@@ -41,6 +53,7 @@ export default function App() {
         if (e.payload) notify("分析出错：" + e.payload);
         refresh();
       }),
+      listen<void>("persons-changed", () => refresh()),
     ];
     check().then((u) => u && setUpdate(u)).catch(() => {});
     return () => uns.forEach((u) => u.then((f) => f()));
@@ -67,6 +80,9 @@ export default function App() {
           </button>
         ))}
         <div className="spacer" />
+        <button className="ext-nav-btn" onClick={triggerInstallExtension} title="安装 Chrome 扩展，在群相册网页直接人脸识别并勾选">
+          安装 Chrome 扩展
+        </button>
         {status && (
           <div className="stat">
             库内 {status.images} 张照片 · {status.videos} 个视频
@@ -117,10 +133,26 @@ export default function App() {
           </div>
         )}
         {tab === "kids" && <Kids persons={persons} refresh={refresh} notify={notify} />}
-        {tab === "import" && status && <Import status={status} refresh={refresh} notify={notify} />}
+        {tab === "import" && status && (
+          <Import status={status} persons={persons} onInstallExt={triggerInstallExtension} refresh={refresh} notify={notify} />
+        )}
         {tab === "results" && status && <Results persons={persons} status={status} refresh={refresh} notify={notify} />}
-        {tab === "settings" && status && <Settings status={status} refresh={refresh} notify={notify} />}
+        {tab === "settings" && status && (
+          <Settings status={status} persons={persons} onInstallExt={triggerInstallExtension} refresh={refresh} notify={notify} />
+        )}
       </main>
+      {extGuide && (
+        <ExtensionInstallModal
+          result={extGuide}
+          persons={persons}
+          onClose={() => setExtGuide(null)}
+          onCopy={() => {
+            navigator.clipboard?.writeText(extGuide.dir).then(() => notify("已复制扩展目录路径"));
+          }}
+          onOpenFolder={() => openPath(extGuide.dir).catch(() => {})}
+          onOpenQxc={() => api.openQxcWeb().catch((e) => notify(String(e)))}
+        />
+      )}
       {toast && <div className="toast" onClick={() => setToast(null)}>{toast}</div>}
     </div>
   );
@@ -237,7 +269,13 @@ function ImportResult({ r }: { r: ImportReport }) {
   );
 }
 
-function Import({ status, refresh, notify }: Common & { status: Status }) {
+function Import({
+  status,
+  persons,
+  onInstallExt,
+  refresh,
+  notify,
+}: Common & { status: Status; persons: Person[]; onInstallExt: () => void }) {
   const [report, setReport] = useState<ImportReport | null>(null);
   const [hover, setHover] = useState(false);
   const busy = useRef(false);
@@ -301,6 +339,7 @@ function Import({ status, refresh, notify }: Common & { status: Status }) {
         </div>
       </div>
       {report && <ImportResult r={report} />}
+      <ChromeExtensionCard status={status} persons={persons} onInstallExt={onInstallExt} notify={notify} />
       <Qxc status={status} refresh={refresh} notify={notify} />
     </section>
   );
@@ -675,7 +714,13 @@ function TimeInput({ value, onCommit }: { value: number; onCommit: (v: number) =
   );
 }
 
-function Settings({ status, refresh, notify }: Common & { status: Status }) {
+function Settings({
+  status,
+  persons,
+  onInstallExt,
+  refresh,
+  notify,
+}: Common & { status: Status; persons: Person[]; onInstallExt: () => void }) {
   const [busy, setBusy] = useState("");
   const run = async (key: string, f: () => Promise<unknown>, ok: string) => {
     setBusy(key);
@@ -705,6 +750,7 @@ function Settings({ status, refresh, notify }: Common & { status: Status }) {
         </div>
         <p className="hint">首次使用需要下载 InsightFace 开源模型，所有识别都在本机完成，照片不会上传。</p>
       </div>
+      <ChromeExtensionCard status={status} persons={persons} onInstallExt={onInstallExt} notify={notify} />
       <div className="card">
         <div className="row">
           <h3>ffmpeg（处理视频用）</h3>
@@ -755,5 +801,118 @@ function Settings({ status, refresh, notify }: Common & { status: Status }) {
         </div>
       </div>
     </section>
+  );
+}
+
+function ChromeExtensionCard({
+  status,
+  persons,
+  onInstallExt,
+  notify,
+}: {
+  status: Status;
+  persons: Person[];
+  onInstallExt: () => void;
+  notify: (m: string) => void;
+}) {
+  const readyKids = persons.filter((p) => p.refs.length > 0);
+  return (
+    <div className="card ext-card">
+      <div className="row">
+        <h3>Chrome 扩展 · 群相册网页直接识别勾选</h3>
+        <span className={status.bridgeRunning ? "ok small" : "warn small"}>
+          {status.bridgeRunning ? `本地服务已就绪 (127.0.0.1:${status.bridgePort})` : "本地服务未启动"}
+        </span>
+        <div className="spacer" />
+        <button onClick={onInstallExt}>一键安装 Chrome 扩展</button>
+        <button className="ghost" onClick={() => api.openQxcWeb().catch((e) => notify(String(e)))}>
+          打开群相册网页
+        </button>
+      </div>
+      <p className="hint" style={{ marginBottom: 4 }}>
+        不想把几百上千张照片全下到本地？装上扩展后，在 <b>qxc.hi.cn</b> 网页里点一下即可调用本机模型扫描缩略图，自动勾选自家宝宝的照片。
+      </p>
+      <div className="small muted">
+        {readyKids.length > 0 ? (
+          <>
+            已自动同步宝宝：<b style={{ color: "#2e7d32" }}>{readyKids.map((p) => `${p.name}（${p.refs.length} 张）`).join("、")}</b>
+            ，装好扩展后无需再次上传宝宝照片。
+          </>
+        ) : (
+          <>提示：先在「① 录入宝宝」添加正脸照，装好扩展后会自动同步到网页端。</>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ExtensionInstallModal({
+  result,
+  persons,
+  onClose,
+  onCopy,
+  onOpenFolder,
+  onOpenQxc,
+}: {
+  result: ExtensionInstallResult;
+  persons: Person[];
+  onClose: () => void;
+  onCopy: () => void;
+  onOpenFolder: () => void;
+  onOpenQxc: () => void;
+}) {
+  const readyKids = persons.filter((p) => p.refs.length > 0);
+  return (
+    <div className="modal" onClick={onClose}>
+      <div className="ext-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="row">
+          <h3 style={{ fontSize: 16 }}>安装「找娃助手」Chrome 扩展</h3>
+          <div className="spacer" />
+          <button className="icon" onClick={onClose}>
+            ✕
+          </button>
+        </div>
+        <div className="ext-status-list">
+          <div className="ok">✓ 扩展文件已准备就绪，路径已复制到剪贴板</div>
+          {result.openedBrowser ? (
+            <div className="ok">✓ 已为你打开 {result.browser} 扩展管理页</div>
+          ) : (
+            <div className="warn">• 请手动在浏览器地址栏打开 <code>chrome://extensions/</code></div>
+          )}
+          {result.openedFolder && <div className="ok">✓ 已在文件管理器中定位到 chrome-extension 文件夹</div>}
+        </div>
+        <ol className="ext-steps">
+          <li>
+            在浏览器扩展页右上角开启 <b>「开发者模式」</b>（如果已开启可跳过）。
+          </li>
+          <li>
+            把刚打开的 <b>chrome-extension</b> 文件夹<b>直接拖入浏览器扩展页</b>即可完成安装
+            <span className="muted">（或点击左上角「加载未打包的扩展程序」，按 Ctrl+V 粘贴路径并确认）</span>。
+          </li>
+          <li>
+            保持本应用开启，打开 <b>https://qxc.hi.cn/#/</b> 群相册网页，右下角会自动出现「找娃助手」浮窗，一键识别并勾选宝宝照片！
+          </li>
+        </ol>
+        {readyKids.length > 0 && (
+          <div className="banner" style={{ marginBottom: 0 }}>
+            已同步宝宝：<b>{readyKids.map((p) => `${p.name}（${p.refs.length} 张参考照）`).join("、")}</b>，在网页端无需重新上传！
+          </div>
+        )}
+        <div className="ext-path">{result.dir}</div>
+        <div className="row">
+          <button onClick={onOpenQxc}>打开群相册网页 (qxc.hi.cn)</button>
+          <button className="ghost" onClick={onOpenFolder}>
+            打开扩展文件夹
+          </button>
+          <button className="ghost" onClick={onCopy}>
+            复制路径
+          </button>
+          <div className="spacer" />
+          <button className="ghost" onClick={onClose}>
+            完成
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }

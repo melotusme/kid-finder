@@ -232,7 +232,17 @@ fn bilinear(img: &RgbImage, x: f32, y: f32) -> Rgb<u8> {
 
 /// Load an image with EXIF orientation applied, downscaled to at most MAX_SIDE.
 pub fn load_image(path: &Path) -> Result<RgbImage> {
-    let mut dec = ImageReader::open(path)?.with_guessed_format()?.into_decoder()?;
+    let dec = ImageReader::open(path)?.with_guessed_format()?.into_decoder()?;
+    decode_with_orientation(dec)
+}
+
+/// Load an image from in-memory bytes with EXIF orientation applied, downscaled to MAX_SIDE.
+pub fn load_image_bytes(bytes: &[u8]) -> Result<RgbImage> {
+    let dec = ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?.into_decoder()?;
+    decode_with_orientation(dec)
+}
+
+fn decode_with_orientation(mut dec: impl ImageDecoder) -> Result<RgbImage> {
     let orientation = dec.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
     let mut img = DynamicImage::from_decoder(dec)?;
     img.apply_orientation(orientation);

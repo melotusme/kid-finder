@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "找娃助手 - 群相册智能勾选",
+  "version": "0.1.1",
+  "description": "连接本机「找娃助手」桌面端，在群相册网页版(qxc.hi.cn)直接做人脸识别并自动勾选自家宝宝照片。",
+  "permissions": ["storage", "activeTab"],
+  "host_permissions": [
+    "https://qxc.hi.cn/*",
+    "http://127.0.0.1:27431/*"
+  ],
+  "icons": {
+    "32": "icons/icon32.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "找娃助手",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "32": "icons/icon32.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://qxc.hi.cn/*"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}
