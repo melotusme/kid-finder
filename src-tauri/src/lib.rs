@@ -344,15 +344,14 @@ async fn confirm_face(app: AppHandle, face_id: i64, person_id: i64) -> CmdResult
     .await
 }
 
-/// "Not my kid": hide this face from future results for that person.
+/// "Not my kid": hide this face from future results for that person and re-score that single media item.
 #[tauri::command]
-async fn reject_face(app: AppHandle, face_id: i64, person_id: i64) -> CmdResult<()> {
+async fn reject_face(app: AppHandle, face_id: i64, person_id: i64, threshold: Option<f32>) -> CmdResult<Option<media::Hit>> {
     blocking(move || {
-        app.state::<AppState>().db.lock().unwrap().execute(
-            "INSERT OR IGNORE INTO rejections(face_id, person_id) VALUES(?1,?2)",
-            params![face_id, person_id],
-        )?;
-        Ok(())
+        let st = app.state::<AppState>();
+        let c = st.db.lock().unwrap();
+        let thresh = threshold.unwrap_or_else(|| crate::threshold(&c));
+        media::reject_and_rescore_media(&c, face_id, person_id, thresh)
     })
     .await
 }
@@ -438,6 +437,7 @@ pub fn run() {
                 web_cache: Mutex::new(HashMap::new()),
             });
             bridge::start(app.handle().clone());
+            media::spawn_thumb_backfill(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

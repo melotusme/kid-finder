@@ -52,6 +52,7 @@ export type Album = { groupId: string; groupName: string; imgCnt: number; videoC
 export type SyncReport = { added: number; duplicates: number; errors: string[]; complete: boolean };
 export type LoginTicket = { token: string; qrSvg: string; expiresInMs: number };
 export type Progress = { stage: "import" | "analyze" | "export"; done: number; total: number; current: string };
+export type ThumbUpdate = { mediaId: number; poster: string };
 
 export const api = {
   status: () => invoke<Status>("get_status"),
@@ -69,7 +70,8 @@ export const api = {
   retryFailed: () => invoke<void>("retry_failed"),
   search: (personId: number, threshold: number) => invoke<Hit[]>("search", { personId, threshold }),
   confirmFace: (faceId: number, personId: number) => invoke<void>("confirm_face", { faceId, personId }),
-  rejectFace: (faceId: number, personId: number) => invoke<void>("reject_face", { faceId, personId }),
+  rejectFace: (faceId: number, personId: number, threshold?: number) =>
+    invoke<Hit | null>("reject_face", { faceId, personId, threshold }),
   exportItems: (outDir: string, items: { mediaId: number; segments: [number, number][] }[], fade: number) =>
     invoke<ExportReport>("export", { outDir, items, fade }),
   qxcCreateLogin: () => invoke<LoginTicket>("qxc_create_login"),

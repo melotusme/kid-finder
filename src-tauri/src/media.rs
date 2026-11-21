@@ -4,11 +4,12 @@ use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
-use std::io::Read;
+use std::collections::HashSet;
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::Ordering;
+use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager};
 
 pub const IMAGE_EXT: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "gif"];
@@ -155,7 +156,145 @@ pub fn import_paths(app: &AppHandle, paths: Vec<String>) -> Result<ImportReport>
     Ok(rep)
 }
 
-// ---------------- background analysis ----------------
+// ---------------- background analysis & photo thumbnails ----------------
+
+const IMAGE_THUMB_MAX: u32 = 480;
+const IMAGE_THUMB_QUALITY: u8 = 82;
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThumbUpdate {
+    pub media_id: i64,
+    pub poster: String,
+}
+
+fn write_jpeg_thumb(thumbs: &Path, media_id: i64, rgb: &image::RgbImage) -> Result<String> {
+    std::fs::create_dir_all(thumbs)?;
+    let dest = thumbs.join(format!("img_{media_id}.jpg"));
+    let tmp = thumbs.join(format!("img_{media_id}.tmp.{}.jpg", uuid::Uuid::new_v4()));
+    {
+        let file = std::fs::File::create(&tmp)?;
+        let mut writer = BufWriter::new(file);
+        let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut writer, IMAGE_THUMB_QUALITY);
+        enc.encode_image(rgb)?;
+        writer.flush()?;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(dest.to_string_lossy().to_string())
+}
+
+/// Resize an already EXIF-oriented `RgbImage` to fit within `480×480` (preserving aspect ratio)
+/// and write `thumbs/img_{media_id}.jpg` at JPEG quality 82.
+pub fn save_image_thumb(thumbs: &Path, media_id: i64, img: &image::RgbImage) -> Result<String> {
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        bail!("空图片无法生成缩略图");
+    }
+    if w <= IMAGE_THUMB_MAX && h <= IMAGE_THUMB_MAX {
+        return write_jpeg_thumb(thumbs, media_id, img);
+    }
+    let (nw, nh) = if w >= h {
+        (IMAGE_THUMB_MAX, ((h as u64 * IMAGE_THUMB_MAX as u64 + w as u64 / 2) / w as u64).max(1) as u32)
+    } else {
+        (((w as u64 * IMAGE_THUMB_MAX as u64 + h as u64 / 2) / h as u64).max(1) as u32, IMAGE_THUMB_MAX)
+    };
+    let resized = image::imageops::thumbnail(img, nw, nh);
+    write_jpeg_thumb(thumbs, media_id, &resized)
+}
+
+/// Generate `thumbs/img_{media_id}.jpg` from `src_path` (with EXIF orientation), reusing an
+/// existing non-empty thumbnail file on disk without decoding if already present.
+pub fn generate_or_reuse_image_thumb(thumbs: &Path, media_id: i64, src_path: &Path) -> Result<String> {
+    let dest = thumbs.join(format!("img_{media_id}.jpg"));
+    if dest.metadata().map(|m| m.is_file() && m.len() > 0).unwrap_or(false) {
+        return Ok(dest.to_string_lossy().to_string());
+    }
+    use image::ImageDecoder as _;
+    let mut dec = image::ImageReader::open(src_path)?.with_guessed_format()?.into_decoder()?;
+    let orientation = dec.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut dyn_img = image::DynamicImage::from_decoder(dec)?;
+    dyn_img.apply_orientation(orientation);
+    let thumb = dyn_img.thumbnail(IMAGE_THUMB_MAX, IMAGE_THUMB_MAX).to_rgb8();
+    write_jpeg_thumb(thumbs, media_id, &thumb)
+}
+
+/// Backfills missing `media.poster` thumbnails for already-analyzed images (`status=1`)
+/// outside the SQLite lock, persisting and reporting in small batches.
+pub fn backfill_missing_thumbs(
+    paths: &crate::Paths,
+    db: &Mutex<Connection>,
+    mut on_batch: impl FnMut(&[ThumbUpdate]),
+) -> Result<usize> {
+    let missing: Vec<(i64, String)> = {
+        let c = db.lock().unwrap();
+        let mut s = c.prepare(
+            "SELECT id, path FROM media WHERE kind='image' AND status=1 AND (poster IS NULL OR poster='') ORDER BY id",
+        )?;
+        let rows = s
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    if missing.is_empty() {
+        return Ok(0);
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).clamp(1, 4))
+        .unwrap_or(2);
+    let thumbs_dir = &paths.thumbs;
+    let mut updated_total = 0usize;
+
+    for chunk in missing.chunks(12) {
+        let generated: Vec<ThumbUpdate> = std::thread::scope(|scope| {
+            let sub_size = (chunk.len() + workers - 1) / workers;
+            let mut handles = Vec::new();
+            for sub in chunk.chunks(sub_size.max(1)) {
+                handles.push(scope.spawn(move || {
+                    let mut out = Vec::with_capacity(sub.len());
+                    for (id, p) in sub {
+                        if let Ok(poster) = generate_or_reuse_image_thumb(thumbs_dir, *id, Path::new(p)) {
+                            out.push(ThumbUpdate { media_id: *id, poster });
+                        }
+                    }
+                    out
+                }));
+            }
+            let mut merged = Vec::with_capacity(chunk.len());
+            for h in handles {
+                if let Ok(mut part) = h.join() {
+                    merged.append(&mut part);
+                }
+            }
+            merged
+        });
+        if generated.is_empty() {
+            continue;
+        }
+        {
+            let mut c = db.lock().unwrap();
+            let tx = c.transaction()?;
+            for u in &generated {
+                tx.execute("UPDATE media SET poster=?2 WHERE id=?1", params![u.media_id, u.poster])?;
+            }
+            tx.commit()?;
+        }
+        updated_total += generated.len();
+        on_batch(&generated);
+    }
+    Ok(updated_total)
+}
+
+pub fn spawn_thumb_backfill(app: AppHandle) {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let _ = backfill_missing_thumbs(&st.paths, &st.db, |batch| {
+            let _ = app.emit("thumbs-updated", batch);
+        });
+    });
+}
 
 pub fn ensure_engine(st: &AppState) -> Result<()> {
     let mut g = st.engine.lock().unwrap();
@@ -217,7 +356,10 @@ fn process_all(app: &AppHandle) -> Result<()> {
         let Some((id, kind, path, name)) = next else { break };
         let _ = app.emit("progress", Progress { stage: "analyze", done, total: done + remaining as usize, current: name });
         let res: Result<(Vec<FaceRow>, Option<String>, Option<f64>)> = if kind == "image" {
-            analyze_file(&st, Path::new(&path)).map(|(img, faces)| (norm_rows(&img, faces, None), None, None))
+            analyze_file(&st, Path::new(&path)).map(|(img, faces)| {
+                let poster = save_image_thumb(&st.paths.thumbs, id, &img).ok();
+                (norm_rows(&img, faces, None), poster, None)
+            })
         } else {
             analyze_video(&st, ffmpeg.as_deref(), id, Path::new(&path))
         };
@@ -337,13 +479,26 @@ pub fn search(c: &Connection, person_id: i64, threshold: f32) -> Result<Vec<Hit>
         .flatten()
         .collect();
     struct Acc {
+        media_id: i64,
+        kind: String,
+        path: String,
+        orig_name: String,
+        poster: Option<String>,
+        time: String,
+        duration: Option<f64>,
         score: f32,
         face_id: i64,
         bbox: [f32; 4],
         times: Vec<f64>,
     }
-    let mut acc: HashMap<i64, Acc> = HashMap::new();
-    let mut s = c.prepare("SELECT id, media_id, t, x1, y1, x2, y2, embedding FROM faces")?;
+    let mut acc: Vec<Acc> = Vec::new();
+    let mut s = c.prepare(
+        "SELECT f.id, f.media_id, f.t, f.x1, f.y1, f.x2, f.y2, f.embedding, \
+                m.kind, m.path, m.orig_name, m.poster, COALESCE(m.remote_time, m.imported_at), m.duration \
+         FROM faces f \
+         JOIN media m ON m.id = f.media_id \
+         ORDER BY f.media_id, f.id",
+    )?;
     let mut rows = s.query([])?;
     while let Some(r) = rows.next()? {
         let fid: i64 = r.get(0)?;
@@ -358,26 +513,147 @@ pub fn search(c: &Connection, person_id: i64, threshold: f32) -> Result<Vec<Hit>
         let mid: i64 = r.get(1)?;
         let t: Option<f64> = r.get(2)?;
         let bbox = [r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?];
-        let e = acc.entry(mid).or_insert(Acc { score: f32::MIN, face_id: fid, bbox, times: vec![] });
-        if sim > e.score {
-            e.score = sim;
-            e.face_id = fid;
-            e.bbox = bbox;
-        }
-        if let Some(t) = t {
-            e.times.push(t);
+        let same_media = acc.last().map(|last| last.media_id == mid).unwrap_or(false);
+        if !same_media {
+            acc.push(Acc {
+                media_id: mid,
+                kind: r.get(8)?,
+                path: r.get(9)?,
+                orig_name: r.get(10)?,
+                poster: r.get(11)?,
+                time: r.get(12)?,
+                duration: r.get(13)?,
+                score: sim,
+                face_id: fid,
+                bbox,
+                times: t.into_iter().collect(),
+            });
+        } else if let Some(e) = acc.last_mut() {
+            if sim > e.score {
+                e.score = sim;
+                e.face_id = fid;
+                e.bbox = bbox;
+            }
+            if let Some(ts) = t {
+                e.times.push(ts);
+            }
         }
     }
-    let mut hits = vec![];
-    let mut ms = c.prepare("SELECT kind, path, orig_name, poster, COALESCE(remote_time, imported_at), duration FROM media WHERE id=?1")?;
-    for (mid, a) in acc {
-        let (kind, path, orig_name, poster, time, duration): (String, String, String, Option<String>, String, Option<f64>) =
-            ms.query_row([mid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?;
-        let segments = if kind == "video" { merge_segments(a.times, duration) } else { vec![] };
-        hits.push(Hit { media_id: mid, kind, path, orig_name, poster, time, score: a.score, face_id: a.face_id, bbox: a.bbox, duration, segments });
-    }
-    hits.sort_by(|a, b| b.time.cmp(&a.time));
+    let mut hits: Vec<Hit> = acc
+        .into_iter()
+        .map(|a| {
+            let segments = if a.kind == "video" { merge_segments(a.times, a.duration) } else { vec![] };
+            Hit {
+                media_id: a.media_id,
+                kind: a.kind,
+                path: a.path,
+                orig_name: a.orig_name,
+                poster: a.poster,
+                time: a.time,
+                score: a.score,
+                face_id: a.face_id,
+                bbox: a.bbox,
+                duration: a.duration,
+                segments,
+            }
+        })
+        .collect();
+    hits.sort_by(|a, b| b.time.cmp(&a.time).then_with(|| b.media_id.cmp(&a.media_id)));
     Ok(hits)
+}
+
+/// Records a face rejection for `person_id` and re-scores ONLY that face's `media_id` at `threshold`.
+/// Returns `Ok(Some(updated_hit))` if another non-rejected face on the same photo/video still matches,
+/// or `Ok(None)` when the media item no longer matches.
+pub fn reject_and_rescore_media(
+    c: &Connection,
+    face_id: i64,
+    person_id: i64,
+    threshold: f32,
+) -> Result<Option<Hit>> {
+    c.execute(
+        "INSERT OR IGNORE INTO rejections(face_id, person_id) VALUES(?1, ?2)",
+        params![face_id, person_id],
+    )?;
+    let Some(media_id): Option<i64> = c
+        .query_row("SELECT media_id FROM faces WHERE id=?1", [face_id], |r| r.get(0))
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let refs = person_refs(c, person_id)?;
+    if refs.is_empty() {
+        return Ok(None);
+    }
+    let rejected: HashSet<i64> = c
+        .prepare(
+            "SELECT r.face_id FROM rejections r JOIN faces f ON f.id = r.face_id WHERE r.person_id=?1 AND f.media_id=?2",
+        )?
+        .query_map(params![person_id, media_id], |r| r.get(0))?
+        .flatten()
+        .collect();
+
+    let mut best_score = f32::MIN;
+    let mut best_face_id: Option<i64> = None;
+    let mut best_bbox = [0.0f32; 4];
+    let mut times: Vec<f64> = Vec::new();
+
+    let mut s = c.prepare("SELECT id, t, x1, y1, x2, y2, embedding FROM faces WHERE media_id=?1 ORDER BY id")?;
+    let mut rows = s.query([media_id])?;
+    while let Some(r) = rows.next()? {
+        let fid: i64 = r.get(0)?;
+        if rejected.contains(&fid) {
+            continue;
+        }
+        let emb = db::blob_to_emb(&r.get::<_, Vec<u8>>(6)?);
+        let sim = refs.iter().map(|q| face::cosine(q, &emb)).fold(f32::MIN, f32::max);
+        if sim < threshold {
+            continue;
+        }
+        if best_face_id.is_none() || sim > best_score {
+            best_score = sim;
+            best_face_id = Some(fid);
+            best_bbox = [r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?];
+        }
+        if let Some(ts) = r.get::<_, Option<f64>>(1)? {
+            times.push(ts);
+        }
+    }
+
+    let Some(fid) = best_face_id else {
+        return Ok(None);
+    };
+    let Some((kind, path, orig_name, poster, time, duration)): Option<(
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<f64>,
+    )> = c
+        .query_row(
+            "SELECT kind, path, orig_name, poster, COALESCE(remote_time, imported_at), duration FROM media WHERE id=?1",
+            [media_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let segments = if kind == "video" { merge_segments(times, duration) } else { vec![] };
+    Ok(Some(Hit {
+        media_id,
+        kind,
+        path,
+        orig_name,
+        poster,
+        time,
+        score: best_score,
+        face_id: fid,
+        bbox: best_bbox,
+        duration,
+        segments,
+    }))
 }
 
 /// Turn the sampled timestamps (1 fps) where the kid appears into merged clips.
@@ -516,6 +792,7 @@ pub fn export(app: &AppHandle, out_dir: &Path, items: Vec<ExportItem>, fade: f64
 mod tests {
     use super::*;
     use crate::Paths;
+    use std::collections::HashMap;
     use std::sync::atomic::AtomicBool;
     use std::sync::Mutex;
 
@@ -617,6 +894,183 @@ mod tests {
 
         drop(c);
         drop(st);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn search_order_is_strictly_deterministic_on_identical_timestamps() {
+        let tmp = std::env::temp_dir().join(format!("kid_finder_det_sort_{}.db", uuid::Uuid::new_v4()));
+        let conn = db::open(&tmp).unwrap();
+        conn.execute("INSERT INTO persons(name, created_at) VALUES('朵朵', '2026-11-20 20:50:00')", [])
+            .unwrap();
+        let pid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO refs(person_id, embedding, thumb, source, created_at) VALUES(?1,?2,NULL,'test','2026-11-20 20:50:00')",
+            params![pid, db::emb_to_blob(&[1.0f32, 0.0f32])],
+        )
+        .unwrap();
+
+        let mut inserted_ids = Vec::new();
+        for i in 0..24 {
+            let sha = format!("sha_same_sec_{i:02}");
+            let orig = format!("IMG_{i:04}.JPG");
+            let path = format!("/tmp/{orig}");
+            conn.execute(
+                "INSERT INTO media(sha256,kind,path,orig_name,source,imported_at,status) VALUES(?1,'image',?2,?3,'local','2026-11-20 20:51:29',1)",
+                params![sha, path, orig],
+            )
+            .unwrap();
+            let mid = conn.last_insert_rowid();
+            inserted_ids.push(mid);
+            conn.execute(
+                "INSERT INTO faces(media_id,t,x1,y1,x2,y2,score,embedding) VALUES(?1,NULL,0.1,0.1,0.4,0.4,0.9,?2)",
+                params![mid, db::emb_to_blob(&[0.8f32, 0.6f32])],
+            )
+            .unwrap();
+        }
+        // Add one newer timestamp row to verify primary sort is still `time DESC`
+        conn.execute(
+            "INSERT INTO media(sha256,kind,path,orig_name,source,imported_at,status) VALUES('sha_newer','image','/tmp/NEW.JPG','NEW.JPG','local','2026-11-20 20:55:00',1)",
+            [],
+        )
+        .unwrap();
+        let newest_mid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO faces(media_id,t,x1,y1,x2,y2,score,embedding) VALUES(?1,NULL,0.2,0.2,0.5,0.5,0.95,?2)",
+            params![newest_mid, db::emb_to_blob(&[0.9f32, 0.43589f32])],
+        )
+        .unwrap();
+
+        let mut expected_order = vec![newest_mid];
+        let mut same_sec_desc = inserted_ids.clone();
+        same_sec_desc.reverse();
+        expected_order.extend(same_sec_desc);
+
+        for _ in 0..15 {
+            let hits = search(&conn, pid, 0.44).unwrap();
+            let got: Vec<i64> = hits.iter().map(|h| h.media_id).collect();
+            assert_eq!(got, expected_order, "search order must never shuffle across calls");
+        }
+
+        drop(conn);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn reject_and_rescore_media_handles_single_and_multi_face_items() {
+        let tmp = std::env::temp_dir().join(format!("kid_finder_reject_{}.db", uuid::Uuid::new_v4()));
+        let conn = db::open(&tmp).unwrap();
+        conn.execute("INSERT INTO persons(name, created_at) VALUES('朵朵', '2026-11-20 20:50:00')", [])
+            .unwrap();
+        let pid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO refs(person_id, embedding, thumb, source, created_at) VALUES(?1,?2,NULL,'test','2026-11-20 20:50:00')",
+            params![pid, db::emb_to_blob(&[1.0f32, 0.0f32])],
+        )
+        .unwrap();
+
+        // Single-face photo
+        conn.execute(
+            "INSERT INTO media(sha256,kind,path,orig_name,poster,source,imported_at,status) VALUES('sha_single','image','/tmp/s.jpg','s.jpg','/tmp/thumb_s.jpg','local','2026-11-20 20:51:29',1)",
+            [],
+        )
+        .unwrap();
+        let mid_single = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO faces(media_id,t,x1,y1,x2,y2,score,embedding) VALUES(?1,NULL,0.1,0.1,0.3,0.3,0.9,?2)",
+            params![mid_single, db::emb_to_blob(&[0.9f32, 0.43589f32])],
+        )
+        .unwrap();
+        let fid_single = conn.last_insert_rowid();
+
+        // Multi-face photo (2 faces above 0.44 threshold)
+        conn.execute(
+            "INSERT INTO media(sha256,kind,path,orig_name,poster,source,imported_at,status) VALUES('sha_multi','image','/tmp/m.jpg','m.jpg','/tmp/thumb_m.jpg','local','2026-11-20 20:51:29',1)",
+            [],
+        )
+        .unwrap();
+        let mid_multi = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO faces(media_id,t,x1,y1,x2,y2,score,embedding) VALUES(?1,NULL,0.1,0.1,0.3,0.3,0.9,?2)",
+            params![mid_multi, db::emb_to_blob(&[0.85f32, 0.52678f32])],
+        )
+        .unwrap();
+        let fid_multi_best = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO faces(media_id,t,x1,y1,x2,y2,score,embedding) VALUES(?1,NULL,0.5,0.2,0.7,0.5,0.9,?2)",
+            params![mid_multi, db::emb_to_blob(&[0.62f32, 0.7846f32])],
+        )
+        .unwrap();
+        let fid_multi_second = conn.last_insert_rowid();
+
+        // Reject single-face photo -> None
+        let r_single = reject_and_rescore_media(&conn, fid_single, pid, 0.44).unwrap();
+        assert!(r_single.is_none());
+
+        // Reject best face on multi-face photo -> falls back to second face!
+        let r_multi_1 = reject_and_rescore_media(&conn, fid_multi_best, pid, 0.44)
+            .unwrap()
+            .expect("second matching face should remain");
+        assert_eq!(r_multi_1.media_id, mid_multi);
+        assert_eq!(r_multi_1.face_id, fid_multi_second);
+        assert!((r_multi_1.score - 0.62).abs() < 1e-4);
+        assert_eq!(r_multi_1.poster.as_deref(), Some("/tmp/thumb_m.jpg"));
+
+        // Reject second face -> None
+        let r_multi_2 = reject_and_rescore_media(&conn, fid_multi_second, pid, 0.44).unwrap();
+        assert!(r_multi_2.is_none());
+        assert!(search(&conn, pid, 0.44).unwrap().is_empty());
+
+        drop(conn);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn save_image_thumb_and_backfill_generate_aspect_preserving_jpeg() {
+        let root = std::env::temp_dir().join(format!("kid_finder_thumb_test_{}", uuid::Uuid::new_v4()));
+        let paths = Paths::new(root.clone()).unwrap();
+        let conn = db::open(&paths.data.join("kid-finder.db")).unwrap();
+        let db_mutex = Mutex::new(conn);
+
+        let full_img = image::RgbImage::from_fn(1200, 900, |x, y| {
+            image::Rgb([(x % 255) as u8, (y % 255) as u8, 128])
+        });
+        let orig_path = paths.library.join("sample_1200x900.jpg");
+        full_img.save(&orig_path).unwrap();
+
+        let mid = {
+            let c = db_mutex.lock().unwrap();
+            c.execute(
+                "INSERT INTO media(sha256,kind,path,orig_name,source,imported_at,status,poster) VALUES('sha_t1','image',?1,'sample.jpg','local','2026-11-20 20:51:29',1,NULL)",
+                params![orig_path.to_string_lossy()],
+            )
+            .unwrap();
+            c.last_insert_rowid()
+        };
+
+        let mut batches: Vec<Vec<ThumbUpdate>> = Vec::new();
+        let count = backfill_missing_thumbs(&paths, &db_mutex, |b| batches.push(b.to_vec())).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0][0].media_id, mid);
+
+        let poster_path = PathBuf::from(&batches[0][0].poster);
+        assert!(poster_path.is_file());
+        let decoded = image::open(&poster_path).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (480, 360));
+
+        let db_poster: Option<String> = db_mutex
+            .lock()
+            .unwrap()
+            .query_row("SELECT poster FROM media WHERE id=?1", [mid], |r| r.get(0))
+            .unwrap();
+        assert_eq!(db_poster.as_deref(), poster_path.to_str());
+
+        // Second backfill run is a no-op since poster is now populated
+        let count_again = backfill_missing_thumbs(&paths, &db_mutex, |_| {}).unwrap();
+        assert_eq!(count_again, 0);
+
+        drop(db_mutex);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

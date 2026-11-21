@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
-import { api, src, fmtTime, parseTime, padSegments, loadClipSettings, saveClipSettings, type ClipSettings, type Status, type Person, type Hit, type Progress, type ImportReport, type Album, type LoginTicket, type ExtensionInstallResult } from "./api";
+import { api, src, fmtTime, parseTime, padSegments, loadClipSettings, saveClipSettings, type ClipSettings, type Status, type Person, type Hit, type Progress, type ThumbUpdate, type ImportReport, type Album, type LoginTicket, type ExtensionInstallResult } from "./api";
 
 type Tab = "kids" | "import" | "photos" | "videos" | "settings";
 const MEDIA_EXT = ["jpg", "jpeg", "png", "webp", "bmp", "gif", "mp4", "mov", "m4v", "avi", "mkv", "3gp", "webm"];
@@ -15,8 +15,10 @@ export default function App() {
   const [status, setStatus] = useState<Status | null>(null);
   const [persons, setPersons] = useState<Person[]>([]);
   const [selectedPersonId, setSelectedPersonId] = useState<number | null>(null);
-  const [threshold, setThreshold] = useState<number>(0.4);
+  const [draftThreshold, setDraftThreshold] = useState<number>(0.4);
+  const [committedThreshold, setCommittedThreshold] = useState<number>(0.4);
   const thresholdSynced = useRef(false);
+  const thresholdTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [progress, setProgress] = useState<Progress | null>(null);
   const [dl, setDl] = useState<{ label: string; done: number; total: number | null } | null>(null);
   const [toast, setToast] = useState<string | null>(null);
@@ -28,14 +30,40 @@ export default function App() {
     setStatus(s);
     setPersons(p);
     if (!thresholdSynced.current) {
-      setThreshold(s.threshold);
+      setDraftThreshold(s.threshold);
+      setCommittedThreshold(s.threshold);
       thresholdSynced.current = true;
     }
   }, []);
-  const notify = (m: string) => {
+  const notify = useCallback((m: string) => {
     setToast(m);
     setTimeout(() => setToast((t) => (t === m ? null : t)), 6000);
-  };
+  }, []);
+
+  const handleThresholdInput = useCallback((v: number) => {
+    setDraftThreshold(v);
+    if (thresholdTimer.current) clearTimeout(thresholdTimer.current);
+    thresholdTimer.current = setTimeout(() => {
+      thresholdTimer.current = null;
+      setCommittedThreshold(v);
+    }, 160);
+  }, []);
+
+  const handleThresholdCommit = useCallback((v: number) => {
+    if (thresholdTimer.current) {
+      clearTimeout(thresholdTimer.current);
+      thresholdTimer.current = null;
+    }
+    setDraftThreshold(v);
+    setCommittedThreshold(v);
+    api.setThreshold(v).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (thresholdTimer.current) clearTimeout(thresholdTimer.current);
+    };
+  }, []);
 
   useEffect(() => {
     if (selectedPersonId === null || !persons.some((p) => p.id === selectedPersonId)) {
@@ -162,8 +190,10 @@ export default function App() {
             status={status}
             pid={activePid}
             onSelectPid={setSelectedPersonId}
-            threshold={threshold}
-            onChangeThreshold={setThreshold}
+            draftThreshold={draftThreshold}
+            committedThreshold={committedThreshold}
+            onInputThreshold={handleThresholdInput}
+            onCommitThreshold={handleThresholdCommit}
             onGoKids={() => setTab("kids")}
             refresh={refresh}
             notify={notify}
@@ -175,8 +205,10 @@ export default function App() {
             status={status}
             pid={activePid}
             onSelectPid={setSelectedPersonId}
-            threshold={threshold}
-            onChangeThreshold={setThreshold}
+            draftThreshold={draftThreshold}
+            committedThreshold={committedThreshold}
+            onInputThreshold={handleThresholdInput}
+            onCommitThreshold={handleThresholdCommit}
             onGoKids={() => setTab("kids")}
             refresh={refresh}
             notify={notify}
@@ -496,25 +528,38 @@ type MediaViewProps = Common & {
   status: Status;
   pid: number | null;
   onSelectPid: (id: number) => void;
-  threshold: number;
-  onChangeThreshold: (v: number) => void;
+  draftThreshold: number;
+  committedThreshold: number;
+  onInputThreshold: (v: number) => void;
+  onCommitThreshold: (v: number) => void;
   onGoKids: () => void;
 };
+
+/** Deterministic `(time DESC, mediaId DESC)` comparator matching `media::search` in Rust. */
+function compareHits(a: Hit, b: Hit): number {
+  if (a.time !== b.time) return b.time < a.time ? -1 : 1;
+  return b.mediaId - a.mediaId;
+}
+
+function insertHitSorted(list: Hit[], item: Hit): Hit[] {
+  const without = list.filter((x) => x.mediaId !== item.mediaId);
+  const idx = without.findIndex((x) => compareHits(item, x) < 0);
+  if (idx === -1) return [...without, item];
+  return [...without.slice(0, idx), item, ...without.slice(idx)];
+}
 
 function usePersonHits({
   kind,
   persons,
   pid,
-  threshold,
-  refsSignature,
+  committedThreshold,
   pending,
   notify,
 }: {
   kind: "image" | "video";
   persons: Person[];
   pid: number | null;
-  threshold: number;
-  refsSignature: string;
+  committedThreshold: number;
   pending: number;
   notify: (m: string) => void;
 }) {
@@ -522,6 +567,20 @@ function usePersonHits({
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [loading, setLoading] = useState(false);
   const reqSeq = useRef(0);
+  const hitsRef = useRef<Hit[]>(hits);
+  hitsRef.current = hits;
+  const selectedRef = useRef<Set<number>>(selected);
+  selectedRef.current = selected;
+  const unselectedByPid = useRef<Map<number, Set<number>>>(new Map());
+
+  const getUnselected = useCallback((personId: number) => {
+    let set = unselectedByPid.current.get(personId);
+    if (!set) {
+      set = new Set<number>();
+      unselectedByPid.current.set(personId, set);
+    }
+    return set;
+  }, []);
 
   const currentPerson = persons.find((p) => p.id === pid) ?? null;
   const refsKey = currentPerson?.refs.map((r) => r.id).join(",") ?? "";
@@ -537,37 +596,254 @@ function usePersonHits({
     }
     setLoading(true);
     try {
-      const all = await api.search(pid, threshold);
+      const all = await api.search(pid, committedThreshold);
       if (seq !== reqSeq.current) return;
       const filtered = all.filter((h) => h.kind === kind);
+      const unsel = getUnselected(pid);
       setHits(filtered);
-      setSelected(new Set(filtered.map((x) => x.mediaId)));
+      setSelected(new Set(filtered.filter((x) => !unsel.has(x.mediaId)).map((x) => x.mediaId)));
     } finally {
       if (seq === reqSeq.current) setLoading(false);
     }
-  }, [pid, currentPerson?.id, hasRefs, refsKey, refsSignature, threshold, kind]);
+  }, [pid, currentPerson?.id, hasRefs, refsKey, committedThreshold, kind, getUnselected]);
 
   useEffect(() => {
     load().catch((e) => notify(String(e)));
-  }, [load, pending]);
+  }, [load, pending, notify]);
 
-  const toggle = (id: number) =>
-    setSelected((s) => {
-      const n = new Set(s);
-      n.has(id) ? n.delete(id) : n.add(id);
-      return n;
+  // Patch backfilled photo thumbnails in-place without re-running `api.search` or touching `selected`.
+  useEffect(() => {
+    if (kind !== "image") return;
+    const un = listen<ThumbUpdate[]>("thumbs-updated", (e) => {
+      const updates = e.payload;
+      if (!updates || updates.length === 0) return;
+      const posterById = new Map<number, string>();
+      for (const u of updates) posterById.set(u.mediaId, u.poster);
+      setHits((prev) => {
+        let changed = false;
+        const next = prev.map((h) => {
+          const p = posterById.get(h.mediaId);
+          if (p && h.poster !== p) {
+            changed = true;
+            return { ...h, poster: p };
+          }
+          return h;
+        });
+        return changed ? next : prev;
+      });
     });
+    return () => {
+      un.then((f) => f());
+    };
+  }, [kind]);
 
-  return { hits, selected, setSelected, loading, currentPerson, hasRefs, load, toggle };
+  const toggle = useCallback(
+    (id: number) => {
+      setSelected((s) => {
+        const n = new Set(s);
+        const unsel = pid !== null ? getUnselected(pid) : null;
+        if (n.has(id)) {
+          n.delete(id);
+          unsel?.add(id);
+        } else {
+          n.add(id);
+          unsel?.delete(id);
+        }
+        return n;
+      });
+    },
+    [pid, getUnselected],
+  );
+
+  const toggleSelectAll = useCallback(() => {
+    const curHits = hitsRef.current;
+    const unsel = pid !== null ? getUnselected(pid) : null;
+    if (selectedRef.current.size > 0) {
+      if (unsel) curHits.forEach((h) => unsel.add(h.mediaId));
+      setSelected(new Set());
+      return;
+    }
+    if (unsel) curHits.forEach((h) => unsel.delete(h.mediaId));
+    setSelected(new Set(curHits.map((h) => h.mediaId)));
+  }, [pid, getUnselected]);
+
+  // Optimistic surgical face rejection: removes/updates ONLY `h.mediaId` in-place with 0 full-grid re-fetch.
+  const rejectHit = useCallback(
+    (h: Hit) => {
+      if (pid === null) return;
+      const wasSelected = selectedRef.current.has(h.mediaId);
+      if (wasSelected) {
+        setSelected((prev) => {
+          if (!prev.has(h.mediaId)) return prev;
+          const n = new Set(prev);
+          n.delete(h.mediaId);
+          return n;
+        });
+      }
+      setHits((prev) => prev.filter((x) => x.mediaId !== h.mediaId));
+
+      api
+        .rejectFace(h.faceId, pid, committedThreshold)
+        .then((replacement) => {
+          if (replacement && replacement.kind === kind) {
+            setHits((prev) => insertHitSorted(prev, replacement));
+            if (wasSelected) {
+              setSelected((prev) => {
+                const n = new Set(prev);
+                n.add(replacement.mediaId);
+                return n;
+              });
+            }
+          }
+        })
+        .catch((e) => {
+          setHits((prev) => insertHitSorted(prev, h));
+          if (wasSelected) {
+            setSelected((prev) => {
+              const n = new Set(prev);
+              n.add(h.mediaId);
+              return n;
+            });
+          }
+          notify(String(e));
+        });
+    },
+    [pid, committedThreshold, kind, notify],
+  );
+
+  return { hits, selected, loading, currentPerson, hasRefs, load, toggle, toggleSelectAll, rejectHit };
 }
 
-function PhotosView({ persons, status, pid, onSelectPid, threshold, onChangeThreshold, onGoKids, refresh, notify }: MediaViewProps) {
-  const { hits, selected, setSelected, loading, currentPerson, hasRefs, load, toggle } = usePersonHits({
+const MemoPhotoTile = memo(function PhotoTile({
+  hit,
+  isSelected,
+  onPreview,
+  onToggle,
+  onConfirm,
+  onReject,
+}: {
+  hit: Hit;
+  isSelected: boolean;
+  onPreview: (h: Hit) => void;
+  onToggle: (mediaId: number) => void;
+  onConfirm: (h: Hit) => void;
+  onReject: (h: Hit) => void;
+}) {
+  return (
+    <div className={"tile" + (isSelected ? " sel" : "")}>
+      <div className="imgwrap" onClick={() => onPreview(hit)}>
+        <img src={src(hit.poster ?? hit.path)} loading="lazy" decoding="async" />
+        <div
+          className="box"
+          style={{
+            left: `${hit.bbox[0] * 100}%`,
+            top: `${hit.bbox[1] * 100}%`,
+            width: `${(hit.bbox[2] - hit.bbox[0]) * 100}%`,
+            height: `${(hit.bbox[3] - hit.bbox[1]) * 100}%`,
+          }}
+        />
+      </div>
+      <div className="row tilebar">
+        <input type="checkbox" checked={isSelected} onChange={() => onToggle(hit.mediaId)} />
+        <span className="muted small">
+          {hit.time.slice(0, 10)} · {(hit.score * 100).toFixed(0)}%
+        </span>
+        <div className="spacer" />
+        <button className="icon" title="是我家宝宝（加入参考并重算）" onClick={() => onConfirm(hit)}>
+          ✓
+        </button>
+        <button className="icon" title="不是我家宝宝" onClick={() => onReject(hit)}>
+          ✕
+        </button>
+      </div>
+    </div>
+  );
+});
+
+const MemoVideoTile = memo(function VideoTile({
+  hit,
+  clip,
+  customSegs,
+  isSelected,
+  onPreview,
+  onToggle,
+  onConfirm,
+  onReject,
+}: {
+  hit: Hit;
+  clip: ClipSettings;
+  customSegs: [number, number][] | undefined;
+  isSelected: boolean;
+  onPreview: (hit: Hit, initialRange: [number, number] | null) => void;
+  onToggle: (mediaId: number) => void;
+  onConfirm: (h: Hit) => void;
+  onReject: (h: Hit) => void;
+}) {
+  const segs = useMemo(
+    () => customSegs ?? padSegments(hit.segments, clip, hit.duration),
+    [customSegs, hit.segments, clip, hit.duration],
+  );
+  const clipSum = segs.reduce((s, [a, b]) => s + b - a, 0);
+  const isEdited = customSegs !== undefined;
+  return (
+    <div className={"tile video-card" + (isSelected ? " sel" : "")}>
+      <div className="vidwrap" onClick={() => onPreview(hit, null)}>
+        {hit.poster ? <img src={src(hit.poster)} loading="lazy" decoding="async" /> : <div className="noposter">▶ 视频预览</div>}
+        <div className="badge">
+          ▶ {segs.length} 段 · 共 {fmtTime(clipSum)}
+          {isEdited && " · 已手动调整"}
+        </div>
+        {hit.duration !== null && <div className="dur-badge">总长 {fmtTime(hit.duration)}</div>}
+      </div>
+      {segs.length > 0 && (
+        <div className="seg-chips">
+          {segs.map(([a, b], idx) => (
+            <button
+              key={idx}
+              className="seg-chip"
+              title="点击试看并微调该片段"
+              onClick={() => onPreview(hit, [a, b])}
+            >
+              {fmtTime(a)}–{fmtTime(b)}
+            </button>
+          ))}
+        </div>
+      )}
+      <div className="row tilebar">
+        <input type="checkbox" checked={isSelected} onChange={() => onToggle(hit.mediaId)} />
+        <span className="muted small">
+          {hit.time.slice(0, 10)} · {(hit.score * 100).toFixed(0)}%
+        </span>
+        <div className="spacer" />
+        <button className="icon" title="是我家宝宝（加入参考并重算）" onClick={() => onConfirm(hit)}>
+          ✓
+        </button>
+        <button className="icon" title="不是我家宝宝" onClick={() => onReject(hit)}>
+          ✕
+        </button>
+      </div>
+    </div>
+  );
+});
+
+function PhotosView({
+  persons,
+  status,
+  pid,
+  onSelectPid,
+  draftThreshold,
+  committedThreshold,
+  onInputThreshold,
+  onCommitThreshold,
+  onGoKids,
+  refresh,
+  notify,
+}: MediaViewProps) {
+  const { hits, selected, loading, currentPerson, hasRefs, load, toggle, toggleSelectAll, rejectHit } = usePersonHits({
     kind: "image",
     persons,
     pid,
-    threshold,
-    refsSignature: status.refsSignature,
+    committedThreshold,
     pending: status.pending,
     notify,
   });
@@ -576,6 +852,20 @@ function PhotosView({ persons, status, pid, onSelectPid, threshold, onChangeThre
   useEffect(() => {
     setPreview((prev) => (prev ? hits.find((x) => x.mediaId === prev.mediaId) ?? null : null));
   }, [hits]);
+
+  const handleConfirm = useCallback(
+    (h: Hit) => {
+      if (pid === null) return;
+      api
+        .confirmFace(h.faceId, pid)
+        .then(() => {
+          notify("已加入参考，已重新计算相似度");
+          return refresh();
+        })
+        .catch((e) => notify(String(e)));
+    },
+    [pid, refresh, notify],
+  );
 
   if (!persons.length) {
     return (
@@ -616,17 +906,16 @@ function PhotosView({ persons, status, pid, onSelectPid, threshold, onChangeThre
           ))}
         </select>
         <label className="muted" title="越高越严格：漏掉的多，认错的少">
-          严格程度 {threshold.toFixed(2)}
+          严格程度 {draftThreshold.toFixed(2)}
           <input
             type="range"
             min={0.25}
             max={0.65}
             step={0.01}
-            value={threshold}
-            onChange={(e) => onChangeThreshold(Number(e.target.value))}
-            onMouseUp={() => api.setThreshold(threshold)}
-            onTouchEnd={() => api.setThreshold(threshold)}
-            onKeyUp={() => api.setThreshold(threshold)}
+            value={draftThreshold}
+            onChange={(e) => onInputThreshold(Number(e.target.value))}
+            onPointerUp={(e) => onCommitThreshold(Number((e.target as HTMLInputElement).value))}
+            onKeyUp={(e) => onCommitThreshold(Number((e.target as HTMLInputElement).value))}
           />
         </label>
         <button
@@ -645,7 +934,7 @@ function PhotosView({ persons, status, pid, onSelectPid, threshold, onChangeThre
         <span className="muted">
           找到 {hits.length} 张照片 · 已选 {selected.size}
         </span>
-        <button className="ghost" disabled={!hits.length} onClick={() => setSelected(new Set(selected.size ? [] : hits.map((h) => h.mediaId)))}>
+        <button className="ghost" disabled={!hits.length} onClick={toggleSelectAll}>
           {selected.size ? "全不选" : "全选"}
         </button>
         <button disabled={!selected.size} onClick={doExport}>
@@ -671,54 +960,15 @@ function PhotosView({ persons, status, pid, onSelectPid, threshold, onChangeThre
           ) : (
             <div className="grid">
               {hits.map((h) => (
-                <div key={h.mediaId} className={"tile" + (selected.has(h.mediaId) ? " sel" : "")}>
-                  <div className="imgwrap" onClick={() => setPreview(h)}>
-                    <img src={src(h.path)} loading="lazy" />
-                    <div
-                      className="box"
-                      style={{
-                        left: `${h.bbox[0] * 100}%`,
-                        top: `${h.bbox[1] * 100}%`,
-                        width: `${(h.bbox[2] - h.bbox[0]) * 100}%`,
-                        height: `${(h.bbox[3] - h.bbox[1]) * 100}%`,
-                      }}
-                    />
-                  </div>
-                  <div className="row tilebar">
-                    <input type="checkbox" checked={selected.has(h.mediaId)} onChange={() => toggle(h.mediaId)} />
-                    <span className="muted small">
-                      {h.time.slice(0, 10)} · {(h.score * 100).toFixed(0)}%
-                    </span>
-                    <div className="spacer" />
-                    <button
-                      className="icon"
-                      title="是我家宝宝（加入参考并重算）"
-                      onClick={() =>
-                        api
-                          .confirmFace(h.faceId, pid!)
-                          .then(() => {
-                            notify("已加入参考，已重新计算相似度");
-                            return refresh();
-                          })
-                          .catch((e) => notify(String(e)))
-                      }
-                    >
-                      ✓
-                    </button>
-                    <button
-                      className="icon"
-                      title="不是我家宝宝"
-                      onClick={() =>
-                        api
-                          .rejectFace(h.faceId, pid!)
-                          .then(() => refresh())
-                          .catch((e) => notify(String(e)))
-                      }
-                    >
-                      ✕
-                    </button>
-                  </div>
-                </div>
+                <MemoPhotoTile
+                  key={h.mediaId}
+                  hit={h}
+                  isSelected={selected.has(h.mediaId)}
+                  onPreview={setPreview}
+                  onToggle={toggle}
+                  onConfirm={handleConfirm}
+                  onReject={rejectHit}
+                />
               ))}
             </div>
           )}
@@ -745,13 +995,24 @@ function PhotosView({ persons, status, pid, onSelectPid, threshold, onChangeThre
   );
 }
 
-function VideosView({ persons, status, pid, onSelectPid, threshold, onChangeThreshold, onGoKids, refresh, notify }: MediaViewProps) {
-  const { hits, selected, setSelected, loading, currentPerson, hasRefs, load, toggle } = usePersonHits({
+function VideosView({
+  persons,
+  status,
+  pid,
+  onSelectPid,
+  draftThreshold,
+  committedThreshold,
+  onInputThreshold,
+  onCommitThreshold,
+  onGoKids,
+  refresh,
+  notify,
+}: MediaViewProps) {
+  const { hits, selected, loading, currentPerson, hasRefs, load, toggle, toggleSelectAll, rejectHit } = usePersonHits({
     kind: "video",
     persons,
     pid,
-    threshold,
-    refsSignature: status.refsSignature,
+    committedThreshold,
     pending: status.pending,
     notify,
   });
@@ -766,6 +1027,24 @@ function VideosView({ persons, status, pid, onSelectPid, threshold, onChangeThre
   };
   const editKey = (mediaId: number) => `${pid ?? "none"}:${mediaId}`;
   const segsOf = (h: Hit) => edits[editKey(h.mediaId)] ?? padSegments(h.segments, clip, h.duration);
+
+  const handlePreviewVideo = useCallback((hit: Hit, initialRange: [number, number] | null) => {
+    setPreview({ hit, initialRange });
+  }, []);
+
+  const handleConfirm = useCallback(
+    (h: Hit) => {
+      if (pid === null) return;
+      api
+        .confirmFace(h.faceId, pid)
+        .then(() => {
+          notify("已加入参考，已重新计算相似度");
+          return refresh();
+        })
+        .catch((e) => notify(String(e)));
+    },
+    [pid, refresh, notify],
+  );
 
   useEffect(() => {
     setPreview((prev) => {
@@ -859,17 +1138,16 @@ function VideosView({ persons, status, pid, onSelectPid, threshold, onChangeThre
           ))}
         </select>
         <label className="muted" title="越高越严格：漏掉的多，认错的少">
-          严格程度 {threshold.toFixed(2)}
+          严格程度 {draftThreshold.toFixed(2)}
           <input
             type="range"
             min={0.25}
             max={0.65}
             step={0.01}
-            value={threshold}
-            onChange={(e) => onChangeThreshold(Number(e.target.value))}
-            onMouseUp={() => api.setThreshold(threshold)}
-            onTouchEnd={() => api.setThreshold(threshold)}
-            onKeyUp={() => api.setThreshold(threshold)}
+            value={draftThreshold}
+            onChange={(e) => onInputThreshold(Number(e.target.value))}
+            onPointerUp={(e) => onCommitThreshold(Number((e.target as HTMLInputElement).value))}
+            onKeyUp={(e) => onCommitThreshold(Number((e.target as HTMLInputElement).value))}
           />
         </label>
         <button
@@ -888,7 +1166,7 @@ function VideosView({ persons, status, pid, onSelectPid, threshold, onChangeThre
         <span className="muted">
           找到 {hits.length} 个视频（共 {totalClips} 段片段）· 已选 {selected.size}
         </span>
-        <button className="ghost" disabled={!hits.length} onClick={() => setSelected(new Set(selected.size ? [] : hits.map((h) => h.mediaId)))}>
+        <button className="ghost" disabled={!hits.length} onClick={toggleSelectAll}>
           {selected.size ? "全不选" : "全选"}
         </button>
         <button disabled={!selected.size} onClick={doExport}>
@@ -913,71 +1191,19 @@ function VideosView({ persons, status, pid, onSelectPid, threshold, onChangeThre
             </div>
           ) : (
             <div className="video-grid">
-              {hits.map((h) => {
-                const segs = segsOf(h);
-                const clipSum = segs.reduce((s, [a, b]) => s + b - a, 0);
-                const isEdited = editKey(h.mediaId) in edits;
-                return (
-                  <div key={h.mediaId} className={"tile video-card" + (selected.has(h.mediaId) ? " sel" : "")}>
-                    <div className="vidwrap" onClick={() => setPreview({ hit: h, initialRange: null })}>
-                      {h.poster ? <img src={src(h.poster)} loading="lazy" /> : <div className="noposter">▶ 视频预览</div>}
-                      <div className="badge">
-                        ▶ {segs.length} 段 · 共 {fmtTime(clipSum)}
-                        {isEdited && " · 已手动调整"}
-                      </div>
-                      {h.duration !== null && <div className="dur-badge">总长 {fmtTime(h.duration)}</div>}
-                    </div>
-                    {segs.length > 0 && (
-                      <div className="seg-chips">
-                        {segs.map(([a, b], idx) => (
-                          <button
-                            key={idx}
-                            className="seg-chip"
-                            title="点击试看并微调该片段"
-                            onClick={() => setPreview({ hit: h, initialRange: [a, b] })}
-                          >
-                            {fmtTime(a)}–{fmtTime(b)}
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                    <div className="row tilebar">
-                      <input type="checkbox" checked={selected.has(h.mediaId)} onChange={() => toggle(h.mediaId)} />
-                      <span className="muted small">
-                        {h.time.slice(0, 10)} · {(h.score * 100).toFixed(0)}%
-                      </span>
-                      <div className="spacer" />
-                      <button
-                        className="icon"
-                        title="是我家宝宝（加入参考并重算）"
-                        onClick={() =>
-                          api
-                            .confirmFace(h.faceId, pid!)
-                            .then(() => {
-                              notify("已加入参考，已重新计算相似度");
-                              return refresh();
-                            })
-                            .catch((e) => notify(String(e)))
-                        }
-                      >
-                        ✓
-                      </button>
-                      <button
-                        className="icon"
-                        title="不是我家宝宝"
-                        onClick={() =>
-                          api
-                            .rejectFace(h.faceId, pid!)
-                            .then(() => refresh())
-                            .catch((e) => notify(String(e)))
-                        }
-                      >
-                        ✕
-                      </button>
-                    </div>
-                  </div>
-                );
-              })}
+              {hits.map((h) => (
+                <MemoVideoTile
+                  key={h.mediaId}
+                  hit={h}
+                  clip={clip}
+                  customSegs={edits[editKey(h.mediaId)]}
+                  isSelected={selected.has(h.mediaId)}
+                  onPreview={handlePreviewVideo}
+                  onToggle={toggle}
+                  onConfirm={handleConfirm}
+                  onReject={rejectHit}
+                />
+              ))}
             </div>
           )}
         </>

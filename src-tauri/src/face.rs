@@ -39,7 +39,9 @@ type Det = ([f32; 4], f32, [[f32; 2]; 5]);
 
 impl FaceEngine {
     pub fn load(dir: &Path) -> Result<Self> {
-        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let threads = std::thread::available_parallelism()
+            .map(|n| (n.get() / 2).clamp(1, 4))
+            .unwrap_or(2);
         let env = ort::init().with_name("kid-finder").build().map_err(|e| anyhow::anyhow!("初始化 ONNX Runtime 失败: {e}"))?;
         let mk = |f: &str| -> Result<Session> {
             let s = Session::builder(&env)
