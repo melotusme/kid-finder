@@ -257,6 +257,21 @@
   user-select: none;
 }
 
+.kf-check.disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.kf-ocr-hint {
+  margin-top: 5px;
+  font-size: 11px;
+  color: #0f766e;
+  background: #f0fdfa;
+  border: 1px solid #99f6e4;
+  border-radius: 6px;
+  padding: 3px 7px;
+}
+
 .kf-slider-box {
   display: flex;
   flex-direction: column;
@@ -407,6 +422,10 @@ body.kf-only-matched .imgItem.kf-unmatched:hover {
   bottom: 6px;
   z-index: 6;
   pointer-events: none;
+  max-width: calc(100% - 12px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   padding: 2px 7px;
   border-radius: 999px;
   font-size: 11px;
@@ -420,6 +439,11 @@ body.kf-only-matched .imgItem.kf-unmatched:hover {
   background: rgba(16, 185, 129, 0.9);
 }
 
+.kf-tile-badge.ocr-hit {
+  background: rgba(13, 148, 136, 0.94);
+  pointer-events: auto;
+}
+
 .kf-tile-badge.miss {
   background: rgba(30, 41, 59, 0.62);
   font-weight: 500;
@@ -430,6 +454,15 @@ body.kf-only-matched .imgItem.kf-unmatched:hover {
   z-index: 5;
   pointer-events: none;
   border: 2px solid #fbbf24;
+  border-radius: 4px;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
+}
+
+.kf-ocr-box {
+  position: absolute;
+  z-index: 5;
+  pointer-events: none;
+  border: 2px solid #0d9488;
   border-radius: 4px;
   box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
 }

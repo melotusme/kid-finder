@@ -56,6 +56,7 @@
     versionCompatible: true,
     extUpdateAvailable: false,
     modelsReady: false,
+    ocrModelsReady: false,
     ffmpegReady: false,
     offlineMsg: "",
     persons: [],
@@ -65,8 +66,9 @@
     totalDbScanned: 0,
     totalVideoScanned: 0,
     defaultExportDir: "",
-    // 多选筛选类型：可单独选照片、单独选视频、或照片+视频一起选
+    // 多选筛选类型：可单独选照片、作品署名 OCR、单独选视频、或一起选
     selectPhotos: true,
+    selectOcr: true,
     selectVideos: true,
     autoClipVideos: true,
     clipLead: 2,
@@ -89,14 +91,23 @@
     photoUnscanned: 0,
     videoTotal: 0,
     videoUnscanned: 0,
-    // id (normalized url without query) -> { kind, maxScore, faceCount, bestBbox, mediaId, duration, segments, error, cached }
+    // id (normalized url without query) -> { kind, maxScore, faceCount, bestBbox, ocrMatched, ocrKeyword, ocrText, ocrBbox, matchSource, mediaId, duration, segments, error, cached }
     results: new Map(),
     // 本次会话中新扫描的 ID（区分「今天新增」与「以前扫过的存量」）
     sessionNewIds: new Set(),
     matchedPhotoCount: 0,
+    matchedOcrCount: 0,
     matchedVideoCount: 0,
     checkedCount: 0,
   };
+
+  function isPersonReady(person) {
+    if (!person) return false;
+    return (
+      person.refCount > 0 ||
+      (state.selectOcr && state.ocrModelsReady && (person.keywordsCount || 0) > 0)
+    );
+  }
 
   function bridge(method, path, body) {
     return new Promise((resolve) => {
@@ -169,7 +180,9 @@
   function getSelectedCandidates() {
     const all = collectPageItems();
     state.loadedCount = all.length;
-    return all.filter((it) => (it.isVideo ? state.selectVideos : state.selectPhotos));
+    const person = state.persons.find((p) => p.id === state.personId);
+    const canUseVideos = state.selectVideos && (!person || person.refCount > 0);
+    return all.filter((it) => (it.isVideo ? canUseVideos : state.selectPhotos));
   }
 
   function isBatchMode() {
@@ -228,12 +241,14 @@
 
   function clearTileDecoration(el) {
     el.classList.remove("kf-matched", "kf-matched-old", "kf-unmatched");
-    el.querySelectorAll(".kf-tile-badge, .kf-face-box").forEach((n) => n.remove());
+    el.querySelectorAll(".kf-tile-badge, .kf-face-box, .kf-ocr-box").forEach((n) => n.remove());
   }
 
-  function decorateTile(el, res, matched, isNew, isVideo) {
+  function decorateTile(el, res, matchInfo, isNew, isVideo) {
     clearTileDecoration(el);
     if (!res) return;
+
+    const { faceHit, ocrHit, matched } = matchInfo;
 
     if (matched) {
       el.classList.add(isNew || state.includeCached ? "kf-matched" : "kf-matched-old");
@@ -246,13 +261,22 @@
       badge.className = "kf-tile-badge miss";
       badge.textContent = "失败";
     } else if (matched) {
-      badge.className = "kf-tile-badge" + (isNew ? "" : " old-hit");
       if (isVideo) {
+        badge.className = "kf-tile-badge" + (isNew ? "" : " old-hit");
         const segs = Array.isArray(res.segments) ? res.segments : [];
         const totalSec = segs.reduce((acc, [a, b]) => acc + Math.max(0, b - a), 0);
         const segInfo = segs.length > 0 ? `▶ ${segs.length}段 ${fmtDur(totalSec)} · ` : "▶ ";
         badge.textContent = `${isNew ? "新 " : "已扫 "}${segInfo}${Math.round(res.maxScore * 100)}%`;
+      } else if (ocrHit && faceHit) {
+        badge.className = "kf-tile-badge" + (isNew ? "" : " old-hit");
+        badge.textContent = `${isNew ? "新 ✓ " : "已扫 ✓ "}${Math.round(res.maxScore * 100)}% · 🏷️${res.ocrKeyword || "署名"}`;
+        badge.title = res.ocrText || "";
+      } else if (ocrHit && !faceHit) {
+        badge.className = "kf-tile-badge ocr-hit";
+        badge.textContent = `${isNew ? "新 " : "已扫 "}🏷️ ${res.ocrKeyword || "署名"}`;
+        badge.title = res.ocrText || "";
       } else {
+        badge.className = "kf-tile-badge" + (isNew ? "" : " old-hit");
         badge.textContent = `${isNew ? "新 ✓ " : "已扫 ✓ "}${Math.round(res.maxScore * 100)}%`;
       }
     } else if (!isNew) {
@@ -267,7 +291,7 @@
     }
     el.appendChild(badge);
 
-    if (!isVideo && matched && Array.isArray(res.bestBbox) && res.bestBbox.length === 4) {
+    if (!isVideo && faceHit && Array.isArray(res.bestBbox) && res.bestBbox.length === 4) {
       const [x1, y1, x2, y2] = res.bestBbox;
       const box = document.createElement("div");
       box.className = "kf-face-box";
@@ -276,6 +300,17 @@
       box.style.width = `${Math.max(2, (x2 - x1) * 100)}%`;
       box.style.height = `${Math.max(2, (y2 - y1) * 100)}%`;
       el.appendChild(box);
+    }
+
+    if (!isVideo && ocrHit && Array.isArray(res.ocrBbox) && res.ocrBbox.length === 4) {
+      const [x1, y1, x2, y2] = res.ocrBbox;
+      const obox = document.createElement("div");
+      obox.className = "kf-ocr-box";
+      obox.style.left = `${Math.max(0, x1 * 100)}%`;
+      obox.style.top = `${Math.max(0, y1 * 100)}%`;
+      obox.style.width = `${Math.max(2, (x2 - x1) * 100)}%`;
+      obox.style.height = `${Math.max(2, (y2 - y1) * 100)}%`;
+      el.appendChild(obox);
     }
   }
 
@@ -305,8 +340,11 @@
   async function syncPageScannedState(autoDecorate = true) {
     if (!state.connected || !state.versionCompatible) return;
     const person = state.persons.find((p) => p.id === state.personId);
-    if (!person || person.refCount === 0) {
+    if (!isPersonReady(person)) {
       state.results.clear();
+      state.matchedPhotoCount = 0;
+      state.matchedOcrCount = 0;
+      state.matchedVideoCount = 0;
       updatePageCounts();
       if (autoDecorate) {
         document.querySelectorAll(".imgItem").forEach(clearTileDecoration);
@@ -338,9 +376,14 @@
               id: r.id,
               kind: r.kind,
               cached: true,
-              maxScore: r.maxScore,
-              faceCount: r.faceCount,
-              bestBbox: r.bestBbox,
+              maxScore: r.maxScore || 0,
+              faceCount: r.faceCount || 0,
+              bestBbox: r.bestBbox || null,
+              ocrMatched: Boolean(r.ocrMatched),
+              ocrKeyword: r.ocrKeyword ?? null,
+              ocrText: r.ocrText ?? null,
+              ocrBbox: Array.isArray(r.ocrBbox) ? r.ocrBbox : null,
+              matchSource: r.matchSource || "none",
               mediaId: r.mediaId,
               duration: r.duration,
               segments: r.segments || [],
@@ -362,10 +405,25 @@
     return it.isVideo ? state.selectVideos : state.selectPhotos;
   }
 
+  function evaluateItemMatch(it, res) {
+    if (!res) {
+      return { faceHit: false, ocrHit: false, matched: false };
+    }
+    if (it.isVideo) {
+      const faceHit = !res.error && res.maxScore >= state.threshold;
+      return { faceHit, ocrHit: false, matched: faceHit };
+    }
+    const faceHit = !res.error && res.maxScore >= state.threshold;
+    const ocrHit = !res.error && state.selectOcr && Boolean(res.ocrMatched);
+    const matched = faceHit || ocrHit;
+    return { faceHit, ocrHit, matched };
+  }
+
   function shouldSelectItem(it, res, photosOnly = false) {
     if (!isTypeEnabled(it)) return false;
     if (photosOnly && it.isVideo) return false;
-    if (!res || res.error || res.maxScore < state.threshold) return false;
+    const { matched } = evaluateItemMatch(it, res);
+    if (!matched) return false;
     const isNew = state.sessionNewIds.has(it.id);
     return isNew || state.includeCached;
   }
@@ -390,6 +448,7 @@
   async function applySelection(autoCheck = true, photosOnly = false) {
     const items = collectPageItems();
     let matchedPhotoCount = 0;
+    let matchedOcrCount = 0;
     let matchedVideoCount = 0;
     let checkedCount = 0;
     let overLimit = false;
@@ -419,13 +478,18 @@
         clearTileDecoration(it.el);
         continue;
       }
-      const matched = !res.error && res.maxScore >= state.threshold;
+      const matchInfo = evaluateItemMatch(it, res);
+      const { ocrHit, matched } = matchInfo;
       const isNew = state.sessionNewIds.has(it.id);
-      decorateTile(it.el, res, matched, isNew, it.isVideo);
+      decorateTile(it.el, res, matchInfo, isNew, it.isVideo);
 
       if (matched) {
-        if (it.isVideo) matchedVideoCount++;
-        else matchedPhotoCount++;
+        if (it.isVideo) {
+          matchedVideoCount++;
+        } else {
+          matchedPhotoCount++;
+          if (ocrHit) matchedOcrCount++;
+        }
         if (autoCheck && batchOn && shouldSelectItem(it, res, photosOnly)) {
           if (checkedCount < MAX_BATCH_SELECT) {
             setItemChecked(it.el, true);
@@ -440,6 +504,7 @@
 
     updatePageCounts();
     state.matchedPhotoCount = matchedPhotoCount;
+    state.matchedOcrCount = matchedOcrCount;
     state.matchedVideoCount = matchedVideoCount;
     state.checkedCount = checkedCount;
     if (overLimit) {
@@ -454,6 +519,7 @@
   function clearPageResultsAndChecks(uncheckBatch = true) {
     state.results.clear();
     state.matchedPhotoCount = 0;
+    state.matchedOcrCount = 0;
     state.matchedVideoCount = 0;
     state.checkedCount = 0;
     document.querySelectorAll(".imgItem").forEach(clearTileDecoration);
@@ -537,7 +603,17 @@
         state.totalDbScanned = resp.data.scannedCount;
       }
       for (const r of resp.data.results || []) {
-        state.results.set(r.id, r);
+        state.results.set(r.id, {
+          ...r,
+          maxScore: r.maxScore || 0,
+          faceCount: r.faceCount || 0,
+          bestBbox: r.bestBbox || null,
+          ocrMatched: Boolean(r.ocrMatched),
+          ocrKeyword: r.ocrKeyword ?? null,
+          ocrText: r.ocrText ?? null,
+          ocrBbox: Array.isArray(r.ocrBbox) ? r.ocrBbox : null,
+          matchSource: r.matchSource || "none",
+        });
         if (!r.cached && !r.error) {
           state.sessionNewIds.add(r.id);
         }
@@ -662,15 +738,27 @@
       render();
       return;
     }
-    if (state.selectVideos && !state.ffmpegReady) {
-      state.notice = { type: "err", text: "已勾选「视频」，但桌面端未安装 ffmpeg。请先在「找娃助手 → 设置」点击自动安装，或先取消勾选「视频」。" };
+    const person = state.persons.find((p) => p.id === state.personId);
+    if (!isPersonReady(person)) {
+      state.showEnroll = true;
+      state.notice = {
+        type: "warn",
+        text:
+          state.selectOcr && state.ocrModelsReady
+            ? "请先为宝宝录入至少 1 张清晰正脸照，或在桌面端填写 2 字以上姓名/小名用于作品署名识别。"
+            : "请先为宝宝录入至少 1 张清晰正脸照。",
+      };
       render();
       return;
     }
-    const person = state.persons.find((p) => p.id === state.personId);
-    if (!person || person.refCount === 0) {
+    if (!state.selectPhotos && state.selectVideos && person.refCount === 0) {
       state.showEnroll = true;
-      state.notice = { type: "warn", text: "请先为宝宝录入至少 1 张清晰正脸照。" };
+      state.notice = { type: "warn", text: "识别视频需要先为宝宝录入至少 1 张清晰正脸照。" };
+      render();
+      return;
+    }
+    if (state.selectVideos && person.refCount > 0 && !state.ffmpegReady) {
+      state.notice = { type: "err", text: "已勾选「视频」，但桌面端未安装 ffmpeg。请先在「找娃助手 → 设置」点击自动安装，或先取消勾选「视频」。" };
       render();
       return;
     }
@@ -773,9 +861,10 @@
             text: `没有发现新增内容，本页此前均已扫过。如需重新勾选/裁剪历史存量，可勾选「同时勾选已扫存量」或点「补扫全部存量」。`,
           };
         } else {
+          const ocrNote = state.matchedOcrCount > 0 ? `（含作品署名 ${state.matchedOcrCount} 张）` : "";
           state.notice = {
             type: state.checkedCount > 0 || clipReport ? "ok" : "warn",
-            text: `${mode === "incremental" ? "增量" : "全量"}完成：${scannedStr}${boundaryTip}，命中照片 ${state.matchedPhotoCount} 张、视频 ${state.matchedVideoCount} 个，页面已勾选 ${state.checkedCount} 项。`,
+            text: `${mode === "incremental" ? "增量" : "全量"}完成：${scannedStr}${boundaryTip}，命中照片 ${state.matchedPhotoCount} 张${ocrNote}、视频 ${state.matchedVideoCount} 个，页面已勾选 ${state.checkedCount} 项。`,
           };
         }
       }
@@ -807,7 +896,9 @@
     state.versionCompatible = isCompatible(d.version, EXT_VERSION);
     state.extUpdateAvailable =
       state.versionCompatible && Boolean(d.extensionVersion) && compareVer(d.extensionVersion, EXT_VERSION) > 0;
+    const prevOcrModelsReady = state.ocrModelsReady;
     state.modelsReady = Boolean(d.modelsReady);
+    state.ocrModelsReady = Boolean(d.ocrModelsReady);
     state.ffmpegReady = Boolean(d.ffmpegReady);
     state.defaultExportDir = d.defaultExportDir || "";
     state.persons = Array.isArray(d.persons) ? d.persons : [];
@@ -824,24 +915,26 @@
     }
     const hasCurrent = state.persons.some((p) => p.id === state.personId);
     if (!hasCurrent) {
-      const withRefs = state.persons.find((p) => p.refCount > 0);
-      state.personId = withRefs ? withRefs.id : state.persons[0] ? state.persons[0].id : null;
+      const readyKid = state.persons.find((p) => isPersonReady(p)) || state.persons.find((p) => p.refCount > 0);
+      state.personId = readyKid ? readyKid.id : state.persons[0] ? state.persons[0].id : null;
     }
     const selectedPerson = state.persons.find((p) => p.id === state.personId);
 
     const nextSig =
-      d.refsSignature || JSON.stringify((d.persons || []).map((p) => [p.id, p.name, p.refCount]));
+      d.refsSignature ||
+      JSON.stringify((d.persons || []).map((p) => [p.id, p.name, p.refCount, p.keywordsCount || 0, p.keywords || []]));
     const sigChanged = state.refsSignature !== null && state.refsSignature !== nextSig;
+    const ocrBecameReady = state.refsSignature !== null && !prevOcrModelsReady && state.ocrModelsReady;
     state.refsSignature = nextSig;
 
-    if (sigChanged) {
+    if (sigChanged || ocrBecameReady) {
       state.results.clear();
-      if (!selectedPerson || selectedPerson.refCount === 0) {
+      if (!isPersonReady(selectedPerson)) {
         clearPageResultsAndChecks(true);
         if (!preserveNotice) {
           state.notice = {
             type: "warn",
-            text: "当前宝宝暂无参考照，已清除页面相似度标注并取消勾选。",
+            text: "当前宝宝暂无参考照或可用署名关键词，已清除页面标注并取消勾选。",
           };
         }
         render();
@@ -853,14 +946,16 @@
       if (!preserveNotice) {
         state.notice = {
           type: "ok",
-          text: "参考照已更新，已重新计算当前页所有已扫照片/视频的相似度。",
+          text: ocrBecameReady && !sigChanged
+            ? "作品识字模型已就绪，已重新检测当前页作品署名。"
+            : "宝宝参考照或署名设置已更新，已重新计算当前页所有已扫照片/视频的匹配结果。",
         };
       }
       render();
       return;
     }
 
-    if (!selectedPerson || selectedPerson.refCount === 0) {
+    if (!isPersonReady(selectedPerson)) {
       clearPageResultsAndChecks(true);
       render();
       return;
@@ -959,7 +1054,10 @@
     }
 
     const person = state.persons.find((p) => p.id === state.personId);
-    const hasReadyKid = Boolean(person && person.refCount > 0);
+    const hasReadyKid = Boolean(
+      person &&
+        (person.refCount > 0 || (state.selectOcr && state.ocrModelsReady && (person.keywordsCount || 0) > 0)),
+    );
     const statusTag = !state.connected
       ? `<span class="kf-status-tag err">未连接</span>`
       : !state.versionCompatible
@@ -1002,12 +1100,16 @@
                    ${state.persons
                      .map(
                        (p) =>
-                         `<option value="${p.id}" ${p.id === state.personId ? "selected" : ""}>${escapeHtml(p.name)}（${p.refCount} 张参考照）</option>`,
+                         `<option value="${p.id}" ${p.id === state.personId ? "selected" : ""}>${escapeHtml(p.name)}（${p.refCount}张照${(p.keywordsCount || 0) > 0 ? ` · ${p.keywordsCount}个署名词` : ""}）</option>`,
                      )
                      .join("")}
                  </select>
                  <div class="kf-row" style="justify-content:space-between; margin-top:2px;">
-                   <span class="kf-sub">已同步桌面端宝宝，无需再上传</span>
+                   <span class="kf-sub" title="${person && Array.isArray(person.keywords) && person.keywords.length ? `作品署名匹配词：${escapeHtml(person.keywords.join("、"))}` : ""}">${
+                     person && Array.isArray(person.keywords) && person.keywords.length
+                       ? `🏷️ ${escapeHtml(person.keywords.slice(0, 3).join("、"))}${person.keywords.length > 3 ? "…" : ""}`
+                       : "已同步桌面端宝宝，无需再上传"
+                   }</span>
                    <button class="kf-link" id="kf-add-ref-link">+ 补充照片</button>
                  </div>
                </div>
@@ -1058,16 +1160,25 @@
                 <span style="font-size:12px;font-weight:600;">筛选类型（可多选）</span>
                 <span class="kf-sub" title="本机累计记住的照片/视频数，永不重复扫">缓存 照${state.totalDbScanned}/视${state.totalVideoScanned}</span>
               </div>
-              <div class="kf-row" style="margin-top:4px; gap:14px;">
+              <div class="kf-row" style="margin-top:4px; gap:10px;">
                 <label class="kf-check">
                   <input type="checkbox" id="kf-type-photo" ${state.selectPhotos ? "checked" : ""} ${busy ? "disabled" : ""} />
                   <span>照片 <b>${state.photoTotal}</b>${state.photoUnscanned > 0 ? ` <span class="kf-pill-mini new">新${state.photoUnscanned}</span>` : ""}</span>
+                </label>
+                <label class="kf-check ${!state.selectPhotos || busy ? "disabled" : ""}" title="同时勾选带有宝宝名字/小名署名的画作、手工、奖状">
+                  <input type="checkbox" id="kf-type-ocr" ${state.selectOcr ? "checked" : ""} ${!state.selectPhotos || busy ? "disabled" : ""} />
+                  <span>🏷️ 作品署名</span>
                 </label>
                 <label class="kf-check">
                   <input type="checkbox" id="kf-type-video" ${state.selectVideos ? "checked" : ""} ${busy ? "disabled" : ""} />
                   <span>视频 <b>${state.videoTotal}</b>${state.videoUnscanned > 0 ? ` <span class="kf-pill-mini new">新${state.videoUnscanned}</span>` : ""}</span>
                 </label>
               </div>
+              ${
+                state.selectOcr && !state.ocrModelsReady
+                  ? `<div class="kf-ocr-hint">桌面端「设置」下载识字模型后生效</div>`
+                  : ""
+              }
               ${
                 state.selectVideos
                   ? `<div class="kf-video-opts">
@@ -1122,8 +1233,8 @@
                 <span style="font-size:12px;font-weight:600;">严格程度：${state.threshold.toFixed(2)}</span>
                 <span class="kf-sub">${
                   hasScannedOnPage
-                    ? `照${state.matchedPhotoCount} · 视${state.matchedVideoCount} · 已勾${state.checkedCount}`
-                    : "拖动可实时增减勾选"
+                    ? `照${state.matchedPhotoCount}(署名${state.matchedOcrCount}) · 视${state.matchedVideoCount} · 已勾${state.checkedCount}`
+                    : "拖动可实时增减人脸勾选"
                 }</span>
               </div>
               <input type="range" id="kf-threshold" min="0.25" max="0.65" step="0.01" value="${state.threshold}" ${busy ? "disabled" : ""} />
@@ -1178,9 +1289,9 @@
         state.results.clear();
         await refreshStatus();
         const person = state.persons.find((p) => p.id === state.personId);
-        if (state.connected && state.versionCompatible && person && person.refCount > 0 && state.results.size > 0) {
+        if (state.connected && state.versionCompatible && isPersonReady(person) && state.results.size > 0) {
           await applySelection(true);
-          state.notice = { type: "ok", text: "已刷新并重新计算相似度。" };
+          state.notice = { type: "ok", text: "已刷新并重新计算相似度与作品署名。" };
           render();
         }
       };
@@ -1192,7 +1303,7 @@
       $("#kf-person-select").onchange = async (e) => {
         state.personId = Number(e.target.value);
         const person = state.persons.find((p) => p.id === state.personId);
-        if (!person || person.refCount === 0) {
+        if (!isPersonReady(person)) {
           clearPageResultsAndChecks(true);
           state.notice = { type: "warn", text: "该宝宝尚未录入参考照，请先录入至少 1 张正脸照。" };
           render();
@@ -1200,12 +1311,13 @@
         }
         state.results.clear();
         state.matchedPhotoCount = 0;
+        state.matchedOcrCount = 0;
         state.matchedVideoCount = 0;
         state.checkedCount = 0;
         document.querySelectorAll(".imgItem").forEach(clearTileDecoration);
         await syncPageScannedState(false);
         await applySelection(true);
-        state.notice = { type: "ok", text: "已切换宝宝，已扫照片与视频已直接从本机缓存重算得分（无需重扫）。" };
+        state.notice = { type: "ok", text: "已切换宝宝，已扫照片与视频已直接从本机缓存重算匹配结果（无需重扫）。" };
         render();
       };
     }
@@ -1231,6 +1343,15 @@
       $("#kf-type-photo").onchange = (e) => {
         state.selectPhotos = Boolean(e.target.checked);
         applySelection(true);
+      };
+    }
+    if ($("#kf-type-ocr")) {
+      $("#kf-type-ocr").onchange = async (e) => {
+        state.selectOcr = Boolean(e.target.checked);
+        if (state.selectOcr && state.results.size === 0) {
+          await syncPageScannedState(false);
+        }
+        await applySelection(true);
       };
     }
     if ($("#kf-type-video")) {
@@ -1330,6 +1451,7 @@
         state.loadedCount = count;
         if (count === 0) {
           state.matchedPhotoCount = 0;
+          state.matchedOcrCount = 0;
           state.matchedVideoCount = 0;
           state.checkedCount = 0;
           state.photoTotal = 0;
