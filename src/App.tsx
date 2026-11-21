@@ -189,6 +189,7 @@ export default function App() {
       {extGuide && (
         <ExtensionInstallModal
           result={extGuide}
+          extensionVersion={status?.extensionVersion}
           persons={persons}
           onClose={() => setExtGuide(null)}
           onCopy={() => {
@@ -1182,6 +1183,7 @@ function Settings({
       <div className="card">
         <div className="row">
           <h3>检查更新</h3>
+          <span className="muted small">当前桌面端 v{status.appVersion} · 内置扩展 v{status.extensionVersion}</span>
           <div className="spacer" />
           <button
             disabled={!!busy}
@@ -1226,6 +1228,7 @@ function ChromeExtensionCard({
     <div className="card ext-card">
       <div className="row">
         <h3>Chrome 扩展 · 群相册网页直接识别勾选</h3>
+        <span className="muted small">扩展 v{status.extensionVersion} · 桌面端 v{status.appVersion}</span>
         <span className={status.bridgeRunning ? "ok small" : "warn small"}>
           {status.bridgeRunning ? `本地服务已就绪 (127.0.0.1:${status.bridgePort})` : "本地服务未启动"}
         </span>
@@ -1272,6 +1275,7 @@ function ChromeExtensionCard({
 
 function ExtensionInstallModal({
   result,
+  extensionVersion,
   persons,
   onClose,
   onCopy,
@@ -1279,6 +1283,7 @@ function ExtensionInstallModal({
   onOpenQxc,
 }: {
   result: ExtensionInstallResult;
+  extensionVersion?: string;
   persons: Person[];
   onClose: () => void;
   onCopy: () => void;
@@ -1290,7 +1295,9 @@ function ExtensionInstallModal({
     <div className="modal" onClick={onClose}>
       <div className="ext-modal" onClick={(e) => e.stopPropagation()}>
         <div className="row">
-          <h3 style={{ fontSize: 16 }}>安装「找娃助手」Chrome 扩展</h3>
+          <h3 style={{ fontSize: 16 }}>
+            安装「找娃助手」Chrome 扩展{extensionVersion ? ` v${extensionVersion}` : ""}
+          </h3>
           <div className="spacer" />
           <button className="icon" onClick={onClose}>
             ✕

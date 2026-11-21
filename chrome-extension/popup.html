@@ -16,6 +16,15 @@
         margin: 0 0 8px;
         font-size: 16px;
         color: #c2410c;
+        display: flex;
+        align-items: baseline;
+        gap: 6px;
+      }
+      .ver {
+        font-size: 12px;
+        font-weight: 500;
+        color: #9a3412;
+        opacity: 0.75;
       }
       .card {
         background: #fff;
@@ -26,6 +35,24 @@
       }
       .ok { color: #166534; font-weight: 600; }
       .err { color: #991b1b; font-weight: 600; }
+      .err-box {
+        margin-top: 6px;
+        padding: 7px 9px;
+        border-radius: 8px;
+        font-size: 12px;
+        background: #fef2f2;
+        color: #991b1b;
+        border: 1px solid #fecaca;
+      }
+      .tip {
+        margin-top: 6px;
+        padding: 6px 9px;
+        border-radius: 8px;
+        font-size: 11.5px;
+        background: #eff6ff;
+        color: #1e40af;
+        border: 1px solid #bfdbfe;
+      }
       .muted { color: #78716c; font-size: 12px; }
       button {
         width: 100%;
@@ -38,11 +65,12 @@
         background: #f59e0b;
         color: #fff;
       }
-      button:hover { filter: brightness(1.06); }
+      button:hover:not(:disabled) { filter: brightness(1.06); }
+      button:disabled { opacity: 0.5; cursor: not-allowed; }
     </style>
   </head>
   <body>
-    <h1>找娃助手 · 群相册插件</h1>
+    <h1>找娃助手 · 群相册插件 <span id="ext-ver" class="ver"></span></h1>
     <div class="card" id="status">正在检查桌面端连接…</div>
     <button id="open">打开群相册网页 (qxc.hi.cn)</button>
     <script src="popup.js"></script>

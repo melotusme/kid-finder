@@ -1,6 +1,8 @@
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 
 export type Status = {
+  appVersion: string;
+  extensionVersion: string;
   modelsReady: boolean;
   ffmpeg: string | null;
   processing: boolean;

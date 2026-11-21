@@ -443,6 +443,7 @@ async fn api_status(app: &AppHandle) -> Result<Value> {
         Ok(json!({
             "ok": true,
             "version": env!("CARGO_PKG_VERSION"),
+            "extensionVersion": crate::extension::bundled_extension_version(),
             "modelsReady": models_ready,
             "ffmpegReady": ffmpeg_ready,
             "threshold": thresh,

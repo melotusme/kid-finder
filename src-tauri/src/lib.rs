@@ -66,6 +66,8 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'sta
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Status {
+    app_version: String,
+    extension_version: String,
     models_ready: bool,
     ffmpeg: Option<String>,
     processing: bool,
@@ -93,6 +95,8 @@ async fn get_status(app: AppHandle) -> CmdResult<Status> {
         let c = st.db.lock().unwrap();
         let n = |sql: &str| -> Result<i64> { Ok(c.query_row(sql, [], |r| r.get(0))?) };
         Ok(Status {
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            extension_version: extension::bundled_extension_version().to_string(),
             models_ready: download::models_ready(&st.paths),
             ffmpeg,
             processing: st.processing.load(Ordering::SeqCst),

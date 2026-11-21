@@ -2,6 +2,42 @@
   if (window.__KID_FINDER_EXT_LOADED__) return;
   window.__KID_FINDER_EXT_LOADED__ = true;
 
+  const EXT_VERSION = chrome.runtime.getManifest().version;
+
+  function parseVer(v) {
+    const s = String(v || "").trim();
+    if (!s) return null;
+    const parts = s.split(".");
+    if (parts.length < 2 || parts.length > 4) return null;
+    const nums = [];
+    for (const p of parts) {
+      if (!/^\d+$/.test(p)) return null;
+      nums.push(Number(p));
+    }
+    return nums;
+  }
+
+  // 大版本基线兼容规则：(major, minor) 必须严格一致，patch 与可选第 4 段小版本允许各自独立迭代
+  function isCompatible(appVer, extVer) {
+    const a = parseVer(appVer);
+    const b = parseVer(extVer);
+    if (!a || !b) return false;
+    return a[0] === b[0] && a[1] === b[1];
+  }
+
+  function compareVer(a, b) {
+    const pa = parseVer(a);
+    const pb = parseVer(b);
+    if (!pa || !pb) return 0;
+    const len = Math.max(pa.length, pb.length);
+    for (let i = 0; i < len; i++) {
+      const va = pa[i] ?? 0;
+      const vb = pb[i] ?? 0;
+      if (va !== vb) return va > vb ? 1 : -1;
+    }
+    return 0;
+  }
+
   // qxc.hi.cn 内置的未选中 / 已选中 radio 图标特征（来自前端 bundle）
   const UNCHECKED_SIG = "AAAEp0lEQVRYCdVZPUgcQRT2";
   const CHECKED_SIG = "AAAEGElEQVRYCc2Zv2/TQBTH";
@@ -15,6 +51,10 @@
   const state = {
     open: true,
     connected: false,
+    desktopVersion: "",
+    desktopExtVersion: "",
+    versionCompatible: true,
+    extUpdateAvailable: false,
     modelsReady: false,
     ffmpegReady: false,
     offlineMsg: "",
@@ -263,7 +303,7 @@
    * 仅查本地 SQLite 缓存（0 网络下载、0 模型推理），同时查询已扫过的照片(web_scans)与视频(media)。
    */
   async function syncPageScannedState(autoDecorate = true) {
-    if (!state.connected) return;
+    if (!state.connected || !state.versionCompatible) return;
     const person = state.persons.find((p) => p.id === state.personId);
     if (!person || person.refCount === 0) {
       state.results.clear();
@@ -609,6 +649,14 @@
       await refreshStatus();
       if (!state.connected) return;
     }
+    if (!state.versionCompatible) {
+      state.notice = {
+        type: "err",
+        text: `版本不匹配：扩展 v${EXT_VERSION} / 桌面端 v${state.desktopVersion}，请打开 chrome://extensions/ 在「找娃助手」点 ↻ 加载 v${state.desktopExtVersion || state.desktopVersion}。`,
+      };
+      render();
+      return;
+    }
     if (!state.modelsReady) {
       state.notice = { type: "err", text: "桌面端尚未下载人脸模型，请先在「找娃助手 → 设置」下载模型。" };
       render();
@@ -754,6 +802,11 @@
     const d = resp.data;
     state.connected = true;
     state.offlineMsg = "";
+    state.desktopVersion = d.version || "";
+    state.desktopExtVersion = d.extensionVersion || "";
+    state.versionCompatible = isCompatible(d.version, EXT_VERSION);
+    state.extUpdateAvailable =
+      state.versionCompatible && Boolean(d.extensionVersion) && compareVer(d.extensionVersion, EXT_VERSION) > 0;
     state.modelsReady = Boolean(d.modelsReady);
     state.ffmpegReady = Boolean(d.ffmpegReady);
     state.defaultExportDir = d.defaultExportDir || "";
@@ -762,6 +815,12 @@
     if (typeof d.videoScannedCount === "number") state.totalVideoScanned = d.videoScannedCount;
     if (typeof d.threshold === "number" && !Number.isNaN(d.threshold)) {
       state.threshold = d.threshold;
+    }
+
+    if (!state.versionCompatible) {
+      clearPageResultsAndChecks(true);
+      render();
+      return;
     }
     const hasCurrent = state.persons.some((p) => p.id === state.personId);
     if (!hasCurrent) {
@@ -876,16 +935,19 @@
 
     if (!state.open) {
       const unscanned = (state.selectPhotos ? state.photoUnscanned : 0) + (state.selectVideos ? state.videoUnscanned : 0);
+      const pillWarn = !state.connected || !state.versionCompatible;
       const label =
-        state.checkedCount > 0
-          ? `找娃助手 · 已勾 ${state.checkedCount}`
-          : unscanned > 0
-            ? `找娃助手 · ${unscanned} 项未扫`
-            : "找娃助手";
+        state.connected && !state.versionCompatible
+          ? `找娃助手 v${EXT_VERSION} · 版本不匹配`
+          : state.checkedCount > 0
+            ? `找娃助手 · 已勾 ${state.checkedCount}`
+            : unscanned > 0
+              ? `找娃助手 · ${unscanned} 项未扫`
+              : `找娃助手 v${EXT_VERSION}`;
       root.innerHTML = `
         <button class="kf-pill" id="kf-open">
-          <span class="kf-pill-dot ${state.connected ? "" : "off"}"></span>
-          <span>${label}</span>
+          <span class="kf-pill-dot ${pillWarn ? "off" : ""}"></span>
+          <span>${escapeHtml(label)}</span>
         </button>
       `;
       root.querySelector("#kf-open").onclick = () => {
@@ -900,16 +962,30 @@
     const hasReadyKid = Boolean(person && person.refCount > 0);
     const statusTag = !state.connected
       ? `<span class="kf-status-tag err">未连接</span>`
-      : !state.modelsReady
-        ? `<span class="kf-status-tag warn">缺少模型</span>`
-        : `<span class="kf-status-tag ok">已连接桌面端</span>`;
+      : !state.versionCompatible
+        ? `<span class="kf-status-tag err">版本不匹配</span>`
+        : !state.modelsReady
+          ? `<span class="kf-status-tag warn">缺少模型</span>`
+          : `<span class="kf-status-tag ok">桌面端 v${escapeHtml(state.desktopVersion)}</span>`;
 
     const kidSection = !state.connected
       ? `<div class="kf-msg err">${escapeHtml(state.offlineMsg)}</div>
          <div class="kf-row">
            <button class="kf-btn secondary" id="kf-reconnect">重新连接</button>
          </div>`
-      : !state.modelsReady
+      : !state.versionCompatible
+        ? `<div class="kf-msg err">
+             <div style="font-weight:700;">版本不匹配：扩展 v${escapeHtml(EXT_VERSION)} / 桌面端 v${escapeHtml(state.desktopVersion)}</div>
+             <div style="margin-top:4px;">大版本基线不一致，扫描与勾选功能已停用。请打开 <code>chrome://extensions/</code>，在「找娃助手」卡片点击 <b>↻</b> 加载 <b>v${escapeHtml(state.desktopExtVersion || state.desktopVersion)}</b>。</div>
+           </div>
+           <div class="kf-row">
+             <button class="kf-btn" id="kf-scan-inc" disabled title="版本不匹配，请先刷新扩展">扫新增并勾选</button>
+             <button class="kf-btn secondary" id="kf-scan-full" disabled title="版本不匹配，请先刷新扩展">补扫全部存量</button>
+           </div>
+           <div class="kf-row">
+             <button class="kf-btn secondary" id="kf-reconnect">重新检测版本</button>
+           </div>`
+        : !state.modelsReady
         ? `<div class="kf-msg err">桌面端尚未下载人脸识别模型，请先打开「找娃助手 → 设置」下载模型。</div>
            <div class="kf-row">
              <button class="kf-btn secondary" id="kf-reconnect">重新检测</button>
@@ -960,17 +1036,22 @@
     root.innerHTML = `
       <div class="kf-panel">
         <div class="kf-header">
-          <span class="kf-title">找娃助手</span>
+          <span class="kf-title">找娃助手 <span class="kf-ver">v${escapeHtml(EXT_VERSION)}</span></span>
           ${statusTag}
           <div class="kf-spacer"></div>
           <button class="kf-icon-btn" id="kf-refresh" title="刷新连接并重新计算当前页相似度" ${busy ? 'disabled style="opacity:0.4;cursor:not-allowed;"' : ""}>↻</button>
           <button class="kf-icon-btn" id="kf-min" title="收起">—</button>
         </div>
         <div class="kf-body">
+          ${
+            state.connected && state.versionCompatible && state.extUpdateAvailable
+              ? `<div class="kf-ver-tip">扩展有小版本可刷新：当前 v${escapeHtml(EXT_VERSION)} → 本机 v${escapeHtml(state.desktopExtVersion)}，在 chrome://extensions 点 ↻ 即可同步</div>`
+              : ""
+          }
           ${kidSection}
 
           ${
-            state.connected && state.modelsReady
+            state.connected && state.versionCompatible && state.modelsReady
               ? `
             <div class="kf-type-box">
               <div class="kf-row" style="justify-content:space-between;">
@@ -1097,7 +1178,7 @@
         state.results.clear();
         await refreshStatus();
         const person = state.persons.find((p) => p.id === state.personId);
-        if (state.connected && person && person.refCount > 0 && state.results.size > 0) {
+        if (state.connected && state.versionCompatible && person && person.refCount > 0 && state.results.size > 0) {
           await applySelection(true);
           state.notice = { type: "ok", text: "已刷新并重新计算相似度。" };
           render();
