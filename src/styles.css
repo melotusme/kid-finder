@@ -16,7 +16,9 @@ button:hover { filter: brightness(1.05); } button:disabled { opacity: .5; cursor
 button.ghost { background: #fff; color: #555; border: 1px solid #ddd; }
 button.danger { background: #fff; color: #c62828; border: 1px solid #f3c1c1; }
 button.icon { background: none; color: #666; padding: 2px 6px; }
+button.small { padding: 4px 10px; font-size: 12px; }
 input, select { font: inherit; padding: 6px 8px; border: 1px solid #ddd; border-radius: 6px; background: #fff; }
+code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; background: #f3f4f6; padding: 1px 5px; border-radius: 4px; }
 a { color: #e08a00; cursor: pointer; }
 .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; } .row.center { justify-content: center; }
 .card { background: #fff; border-radius: 10px; padding: 14px 16px; margin: 12px 0; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
@@ -36,6 +38,18 @@ a { color: #e08a00; cursor: pointer; }
 .imgwrap img { width: 100%; height: 100%; object-fit: cover; }
 .box { position: absolute; border: 2px solid rgba(245, 158, 11, .7); border-radius: 4px; box-shadow: 0 0 0 1px rgba(0,0,0,.22); pointer-events: none; transition: border-color .15s, box-shadow .15s; }
 .tile:hover .box { border-color: #f59e0b; box-shadow: 0 0 0 2px rgba(245, 158, 11, .35); }
+.box.ocr-box { border-color: rgba(13, 148, 136, .88); border-radius: 3px; }
+.tile:hover .box.ocr-box { border-color: #0d9488; box-shadow: 0 0 0 2px rgba(13, 148, 136, .35); }
+.ocr-badge { position: absolute; left: 6px; bottom: 6px; background: rgba(13, 148, 136, .92); color: #fff; padding: 1px 8px; border-radius: 10px; font-size: 12px; max-width: calc(100% - 12px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; pointer-events: none; }
+.ocr-preview-tag { display: inline-block; margin-left: 8px; background: #f0fdfa; color: #0f766e; border: 1px solid #99f6e4; border-radius: 999px; padding: 1px 10px; font-size: 12px; }
+.ocr-profile-box { margin-top: 10px; padding: 8px 10px; background: #fafafa; border: 1px solid #eee; border-radius: 8px; }
+.kw-chip { background: #f0fdfa; color: #0f766e; border: 1px solid #99f6e4; border-radius: 999px; padding: 1px 9px; font-size: 12px; }
+.filter-pills { display: inline-flex; gap: 4px; background: #ececef; padding: 3px; border-radius: 8px; }
+.filter-pills .pill { background: transparent; color: #555; border: none; border-radius: 6px; padding: 4px 10px; font-size: 12.5px; }
+.filter-pills .pill.active { background: #fff; color: #d97706; font-weight: 600; box-shadow: 0 1px 2px rgba(0,0,0,.06); }
+.filter-pills .pill.ocr-pill.active { color: #0f766e; }
+.wx-auto-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; margin-top: 10px; }
+.wx-subcard { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px 12px; }
 .badge { position: absolute; left: 6px; bottom: 6px; background: #000a; color: #fff; padding: 1px 8px; border-radius: 10px; font-size: 12px; }
 .dur-badge { position: absolute; right: 6px; bottom: 6px; background: #000a; color: #fff; padding: 1px 7px; border-radius: 8px; font-size: 12px; font-variant-numeric: tabular-nums; }
 .tilebar { padding: 4px 8px; gap: 4px; }
@@ -52,7 +66,7 @@ a { color: #e08a00; cursor: pointer; }
 .progress { display: flex; gap: 10px; align-items: center; background: #fff; padding: 8px 12px; border-radius: 8px; margin-bottom: 10px; font-size: 13px; }
 .progress progress { flex: 0 0 240px; }
 .progress span:last-child { color: #888; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.banner { background: #e8f5e9; padding: 8px 12px; border-radius: 8px; margin-bottom: 10px; display: flex; gap: 10px; align-items: center; }
+.banner { background: #e8f5e9; padding: 8px 12px; border-radius: 8px; margin-bottom: 10px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #333; color: #fff; padding: 10px 18px; border-radius: 8px; max-width: 70vw; z-index: 10; cursor: pointer; }
 .modal { position: fixed; inset: 0; background: #000b; display: grid; place-items: center; z-index: 5; }
 .modal > div { background: #fff; padding: 12px; border-radius: 10px; max-width: 90vw; max-height: 92vh; display: flex; flex-direction: column; gap: 8px; }

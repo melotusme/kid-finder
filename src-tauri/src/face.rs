@@ -42,9 +42,9 @@ impl FaceEngine {
         let threads = std::thread::available_parallelism()
             .map(|n| (n.get() / 2).clamp(1, 4))
             .unwrap_or(2);
-        let env = ort::init().with_name("kid-finder").build().map_err(|e| anyhow::anyhow!("初始化 ONNX Runtime 失败: {e}"))?;
+        let env = crate::ocr::ort_env()?;
         let mk = |f: &str| -> Result<Session> {
-            let s = Session::builder(&env)
+            let s = Session::builder(env)
                 .map_err(|e| anyhow::anyhow!("{e}"))?
                 .with_intra_threads(threads)
                 .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -270,4 +270,20 @@ pub fn face_thumb(img: &RgbImage, bbox: &[f32; 4], size: u32) -> RgbImage {
 
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_ort_env_coexists_across_face_and_ocr_builders() -> Result<()> {
+        let env1 = crate::ocr::ort_env()?;
+        let env2 = crate::ocr::ort_env()?;
+        assert_eq!(env1 as *const _, env2 as *const _);
+        // Creating SessionBuilders for both FaceEngine and OcrEngine in one process must never fail.
+        let _face_builder = Session::builder(env1).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let _ocr_builder = Session::builder(env2).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(())
+    }
 }

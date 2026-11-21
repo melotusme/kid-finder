@@ -3,13 +3,19 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
 pub fn open(path: &Path) -> Result<Connection> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let c = Connection::open(path)?;
     c.execute_batch(
         r#"
         PRAGMA journal_mode=WAL;
         PRAGMA foreign_keys=ON;
         CREATE TABLE IF NOT EXISTS persons(
-            id INTEGER PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL);
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            aliases TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS refs(
             id INTEGER PRIMARY KEY,
             person_id INTEGER NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
@@ -25,6 +31,7 @@ pub fn open(path: &Path) -> Result<Connection> {
             remote_time TEXT,
             imported_at TEXT NOT NULL,
             status INTEGER NOT NULL DEFAULT 0,
+            ocr_done INTEGER NOT NULL DEFAULT 0,
             error TEXT, poster TEXT, duration REAL);
         CREATE TABLE IF NOT EXISTS faces(
             id INTEGER PRIMARY KEY,
@@ -35,18 +42,43 @@ pub fn open(path: &Path) -> Result<Connection> {
         CREATE TABLE IF NOT EXISTS rejections(
             face_id INTEGER NOT NULL, person_id INTEGER NOT NULL,
             PRIMARY KEY(face_id, person_id));
+        CREATE TABLE IF NOT EXISTS ocr_texts(
+            id INTEGER PRIMARY KEY,
+            media_id INTEGER NOT NULL REFERENCES media(id) ON DELETE CASCADE,
+            x1 REAL NOT NULL, y1 REAL NOT NULL, x2 REAL NOT NULL, y2 REAL NOT NULL,
+            text TEXT NOT NULL,
+            norm_text TEXT NOT NULL,
+            score REAL NOT NULL);
+        CREATE INDEX IF NOT EXISTS ocr_texts_media ON ocr_texts(media_id);
+        CREATE TABLE IF NOT EXISTS ocr_rejections(
+            ocr_id INTEGER NOT NULL,
+            person_id INTEGER NOT NULL,
+            PRIMARY KEY(ocr_id, person_id));
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS web_scans(
             item_id TEXT PRIMARY KEY,
-            scanned_at TEXT NOT NULL);
+            scanned_at TEXT NOT NULL,
+            ocr_done INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS web_faces(
             id INTEGER PRIMARY KEY,
             item_id TEXT NOT NULL REFERENCES web_scans(item_id) ON DELETE CASCADE,
             x1 REAL NOT NULL, y1 REAL NOT NULL, x2 REAL NOT NULL, y2 REAL NOT NULL,
             embedding BLOB NOT NULL);
         CREATE INDEX IF NOT EXISTS web_faces_item ON web_faces(item_id);
+        CREATE TABLE IF NOT EXISTS web_ocr_texts(
+            id INTEGER PRIMARY KEY,
+            item_id TEXT NOT NULL REFERENCES web_scans(item_id) ON DELETE CASCADE,
+            x1 REAL NOT NULL, y1 REAL NOT NULL, x2 REAL NOT NULL, y2 REAL NOT NULL,
+            text TEXT NOT NULL,
+            norm_text TEXT NOT NULL,
+            score REAL NOT NULL);
+        CREATE INDEX IF NOT EXISTS web_ocr_item ON web_ocr_texts(item_id);
         "#,
     )?;
+    // Idempotent column migrations for databases created by earlier versions.
+    let _ = c.execute("ALTER TABLE persons ADD COLUMN aliases TEXT NOT NULL DEFAULT ''", []);
+    let _ = c.execute("ALTER TABLE media ADD COLUMN ocr_done INTEGER NOT NULL DEFAULT 0", []);
+    let _ = c.execute("ALTER TABLE web_scans ADD COLUMN ocr_done INTEGER NOT NULL DEFAULT 0", []);
     Ok(c)
 }
 

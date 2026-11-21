@@ -97,7 +97,7 @@ fn exe(name: &str) -> String {
 }
 
 pub fn find_ffmpeg(st: &AppState) -> Option<PathBuf> {
-    let local = st.paths.bin.join(exe("ffmpeg"));
+    let local = st.paths().bin.join(exe("ffmpeg"));
     if local.is_file() {
         return Some(local);
     }

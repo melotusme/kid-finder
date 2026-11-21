@@ -188,7 +188,7 @@ async fn fetch_one(app: &AppHandle, http: &reqwest::Client, rid: &str, url: &str
     let st = app.state::<AppState>();
     let raw = url.split('?').next().unwrap_or(url);
     let name = raw.rsplit('/').next().unwrap_or("file").to_string();
-    let tmp: PathBuf = st.paths.tmp.join(format!("dl_{}", uuid::Uuid::new_v4()));
+    let tmp: PathBuf = st.paths().tmp.join(format!("dl_{}", uuid::Uuid::new_v4()));
     let ext = std::path::Path::new(&name).extension().and_then(|e| e.to_str()).unwrap_or(if kind == "video" { "mp4" } else { "jpg" });
     let tmp = tmp.with_extension(ext);
     let bytes = http.get(raw).send().await?.error_for_status()?.bytes().await?;

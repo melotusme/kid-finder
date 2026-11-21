@@ -1,19 +1,23 @@
-//! Import (with duplicate detection), background analysis, search and export.
-use crate::{db, face, download, AppState};
+//! Import (with duplicate detection, WeChat legacy `.dat` decoding, in-place video indexing,
+//! and staging watch folder), background face + OCR analysis, combined search, and export.
+use crate::{db, download, face, ocr, storage, wechat, AppState};
 use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 
 pub const IMAGE_EXT: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "gif"];
 pub const VIDEO_EXT: &[&str] = &["mp4", "mov", "m4v", "avi", "mkv", "3gp", "webm"];
+const MAX_LEGACY_DAT_BYTES: u64 = 50 * 1024 * 1024;
+pub const PURGE_CONSERVATIVE_FACE_FLOOR: f32 = 0.32;
 
 pub fn kind_of(p: &Path) -> Option<&'static str> {
     let ext = p.extension()?.to_str()?.to_ascii_lowercase();
@@ -24,6 +28,39 @@ pub fn kind_of(p: &Path) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+fn is_dat_file(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("dat"))
+        .unwrap_or(false)
+}
+
+fn is_redundant_thumb_dat(path: &Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    let lower = stem.to_ascii_lowercase();
+    if !lower.ends_with("_t") || lower.len() <= 2 {
+        return false;
+    }
+    let base = &stem[..stem.len() - 2];
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    parent.join(format!("{base}.dat")).is_file()
+        || parent.join(format!("{base}.DAT")).is_file()
+        || parent.join(format!("{base}_h.dat")).is_file()
+        || parent.join(format!("{base}_h.DAT")).is_file()
+}
+
+/// Guard against ever treating internal WeChat data directories as a staging watch folder.
+pub fn is_wechat_internal_path(p: &Path) -> bool {
+    p.components().any(|c| {
+        let s = c.as_os_str().to_string_lossy().to_ascii_lowercase();
+        s == "xwechat_files" || s == "wechat files" || s == "com.tencent.xinwechat"
+    })
 }
 
 pub fn sha256_file(p: &Path) -> Result<String> {
@@ -38,6 +75,12 @@ pub fn sha256_file(p: &Path) -> Result<String> {
         h.update(&buf[..n]);
     }
     Ok(hex::encode(h.finalize()))
+}
+
+pub fn sha256_bytes(bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    hex::encode(h.finalize())
 }
 
 #[derive(Serialize, Clone)]
@@ -57,7 +100,7 @@ pub struct ImportReport {
     pub errors: Vec<String>,
 }
 
-/// Returns (orig_name, imported_at) if a file with this hash is already in the library.
+/// Returns `(orig_name, imported_at)` if a file with this hash is already in the library (including purged tombstones).
 pub fn find_by_sha(c: &Connection, sha: &str) -> Result<Option<(String, String)>> {
     Ok(c.query_row(
         "SELECT orig_name, imported_at FROM media WHERE sha256=?1",
@@ -79,6 +122,7 @@ pub struct NewMedia<'a> {
 }
 
 pub fn store_file(st: &AppState, m: NewMedia) -> Result<i64> {
+    let paths = st.paths();
     let ext = m
         .src
         .extension()
@@ -86,7 +130,7 @@ pub fn store_file(st: &AppState, m: NewMedia) -> Result<i64> {
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_else(|| if m.kind == "video" { "mp4".into() } else { "jpg".into() });
     let category = if m.kind == "video" { "videos" } else { "photos" };
-    let dir = st.paths.library.join(category).join(&m.sha[..2]);
+    let dir = paths.library.join(category).join(&m.sha[..2]);
     std::fs::create_dir_all(&dir)?;
     let dest = dir.join(format!("{}.{ext}", m.sha));
     if m.move_file {
@@ -105,12 +149,82 @@ pub fn store_file(st: &AppState, m: NewMedia) -> Result<i64> {
     Ok(c.last_insert_rowid())
 }
 
+fn store_decoded_image_bytes(
+    st: &AppState,
+    bytes: &[u8],
+    sha: &str,
+    ext: &str,
+    orig_name: &str,
+    source: &str,
+) -> Result<i64> {
+    let paths = st.paths();
+    let dir = paths.library.join("photos").join(&sha[..2]);
+    std::fs::create_dir_all(&dir)?;
+    let dest = dir.join(format!("{sha}.{ext}"));
+    std::fs::write(&dest, bytes)?;
+    let c = st.db.lock().unwrap();
+    c.execute(
+        "INSERT INTO media(sha256,kind,path,orig_name,source,imported_at) VALUES(?1,'image',?2,?3,?4,?5)",
+        params![sha, dest.to_string_lossy(), orig_name, source, db::now()],
+    )?;
+    Ok(c.last_insert_rowid())
+}
+
+/// Indexes an external file (e.g. a downloaded plaintext video in `xwechat_files/.../msg/video`)
+/// in-place without copying bytes into `library/`. Strictly read-only on `src`.
+pub fn store_external_file(
+    c: &Connection,
+    src: &Path,
+    sha: &str,
+    kind: &str,
+    orig_name: &str,
+    source: &str,
+) -> Result<i64> {
+    c.execute(
+        "INSERT INTO media(sha256,kind,path,orig_name,source,imported_at) VALUES(?1,?2,?3,?4,?5,?6)",
+        params![sha, kind, src.to_string_lossy(), orig_name, source, db::now()],
+    )?;
+    Ok(c.last_insert_rowid())
+}
+
 #[derive(Serialize, Clone)]
-struct Progress<'a> {
-    stage: &'a str,
-    done: usize,
-    total: usize,
-    current: String,
+pub struct Progress<'a> {
+    pub stage: &'a str,
+    pub done: usize,
+    pub total: usize,
+    pub current: String,
+}
+
+fn try_ingest_legacy_dat(
+    st: &AppState,
+    f: &Path,
+    source: &str,
+    rep: &mut ImportReport,
+) -> Result<bool> {
+    if is_redundant_thumb_dat(f) {
+        return Ok(false);
+    }
+    let meta = std::fs::metadata(f)?;
+    if meta.len() < 64 || meta.len() > MAX_LEGACY_DAT_BYTES {
+        rep.unsupported += 1;
+        return Ok(false);
+    }
+    let raw = std::fs::read(f)?;
+    let Some((ext, decoded)) = wechat::decode_legacy_dat(&raw) else {
+        rep.unsupported += 1;
+        return Ok(false);
+    };
+    let stem = f.file_stem().and_then(|s| s.to_str()).unwrap_or("wechat_img");
+    let orig_name = format!("{stem}.{ext}");
+    let sha = sha256_bytes(&decoded);
+    let existing = find_by_sha(&st.db.lock().unwrap(), &sha)?;
+    if let Some((existing_name, imported_at)) = existing {
+        rep.duplicates.push(Duplicate { name: orig_name, existing_name, imported_at });
+        return Ok(true);
+    }
+    store_decoded_image_bytes(st, &decoded, &sha, ext, &orig_name, source)?;
+    rep.added += 1;
+    Ok(true)
 }
 
 pub fn import_paths(app: &AppHandle, paths: Vec<String>) -> Result<ImportReport> {
@@ -133,18 +247,74 @@ pub fn import_paths(app: &AppHandle, paths: Vec<String>) -> Result<ImportReport>
     for (i, f) in files.iter().enumerate() {
         let name = f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         let _ = app.emit("progress", Progress { stage: "import", done: i, total, current: name.clone() });
+        if let Some(kind) = kind_of(f) {
+            let r: Result<()> = (|| {
+                let sha = sha256_file(f)?;
+                let existing = find_by_sha(&st.db.lock().unwrap(), &sha)?;
+                if let Some((existing_name, imported_at)) = existing {
+                    rep.duplicates.push(Duplicate { name: name.clone(), existing_name, imported_at });
+                    return Ok(());
+                }
+                store_file(
+                    &st,
+                    NewMedia {
+                        src: f,
+                        sha: &sha,
+                        kind,
+                        orig_name: &name,
+                        source: "local",
+                        remote_id: None,
+                        remote_time: None,
+                        move_file: false,
+                    },
+                )?;
+                rep.added += 1;
+                Ok(())
+            })();
+            if let Err(e) = r {
+                rep.errors.push(format!("{name}: {e:#}"));
+            }
+        } else if is_dat_file(f) {
+            if let Err(e) = try_ingest_legacy_dat(&st, f, "wechat-dat", &mut rep) {
+                rep.errors.push(format!("{name}: {e:#}"));
+            }
+        } else {
+            rep.unsupported += 1;
+        }
+    }
+    let _ = app.emit("progress", Progress { stage: "import", done: total, total, current: String::new() });
+    Ok(rep)
+}
+
+/// Scans discovered local WeChat 4.x / 3.9 plaintext video & file attachment directories in
+/// strictly read-only mode and indexes them in-place (`move_file=false`, zero copy into `library/`).
+pub fn import_wechat_videos(app: &AppHandle) -> Result<ImportReport> {
+    let st = app.state::<AppState>();
+    let sources = wechat::discover_wechat_sources();
+    let mut files: Vec<PathBuf> = Vec::new();
+    for src in &sources {
+        files.extend(wechat::collect_plaintext_media_files(src));
+    }
+    files.sort();
+    files.dedup();
+
+    let mut rep = ImportReport::default();
+    let total = files.len();
+    for (i, f) in files.iter().enumerate() {
+        let name = f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let _ = app.emit("progress", Progress { stage: "import", done: i, total, current: name.clone() });
         let Some(kind) = kind_of(f) else {
             rep.unsupported += 1;
             continue;
         };
         let r: Result<()> = (|| {
             let sha = sha256_file(f)?;
-            let existing = find_by_sha(&st.db.lock().unwrap(), &sha)?;
-            if let Some((existing_name, imported_at)) = existing {
+            let c = st.db.lock().unwrap();
+            if let Some((existing_name, imported_at)) = find_by_sha(&c, &sha)? {
                 rep.duplicates.push(Duplicate { name: name.clone(), existing_name, imported_at });
                 return Ok(());
             }
-            store_file(&st, NewMedia { src: f, sha: &sha, kind, orig_name: &name, source: "local", remote_id: None, remote_time: None, move_file: false })?;
+            store_external_file(&c, f, &sha, kind, &name, "wechat-local")?;
             rep.added += 1;
             Ok(())
         })();
@@ -154,6 +324,109 @@ pub fn import_paths(app: &AppHandle, paths: Vec<String>) -> Result<ImportReport>
     }
     let _ = app.emit("progress", Progress { stage: "import", done: total, total, current: String::new() });
     Ok(rep)
+}
+
+/// Polls the user-configured WeChat staging watch folder once (`min_age = 3s` so mid-write files are untouched).
+/// When `wechat_watch_autoclean == "1"`, deletes a staging file ONLY after it is safely stored or SHA-deduped,
+/// and NEVER touches any directory inside `xwechat_files` / `WeChat Files` / `storage_root` / `app_data_dir`.
+pub fn poll_wechat_watch_once(st: &AppState) -> Result<usize> {
+    let (watch_dir_opt, autoclean) = {
+        let c = st.db.lock().unwrap();
+        let dir = db::get_setting(&c, "wechat_watch_dir").filter(|s| !s.trim().is_empty());
+        let clean = db::get_setting(&c, "wechat_watch_autoclean").as_deref() == Some("1");
+        (dir, clean)
+    };
+    let Some(watch_str) = watch_dir_opt else {
+        return Ok(0);
+    };
+    let watch_dir = PathBuf::from(watch_str.trim());
+    let paths = st.paths();
+    if !watch_dir.is_dir()
+        || is_wechat_internal_path(&watch_dir)
+        || storage::is_path_inside(&watch_dir, &paths.storage_root)
+        || storage::is_path_inside(&watch_dir, &st.app_data_dir)
+    {
+        return Ok(0);
+    }
+
+    let files = wechat::collect_stable_watch_files(&watch_dir, Duration::from_secs(3));
+    if files.is_empty() {
+        return Ok(0);
+    }
+
+    let mut added = 0usize;
+    for f in files {
+        let can_clean = autoclean
+            && storage::is_path_inside(&f, &watch_dir)
+            && !is_wechat_internal_path(&f)
+            && !storage::is_path_inside(&f, &paths.library);
+
+        if let Some(kind) = kind_of(&f) {
+            let name = f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let Ok(sha) = sha256_file(&f) else { continue };
+            let already_known = find_by_sha(&st.db.lock().unwrap(), &sha)?.is_some();
+            if already_known {
+                if can_clean {
+                    let _ = std::fs::remove_file(&f);
+                }
+                continue;
+            }
+            if let Ok(mid) = store_file(
+                st,
+                NewMedia {
+                    src: &f,
+                    sha: &sha,
+                    kind,
+                    orig_name: &name,
+                    source: "wechat-watch",
+                    remote_id: None,
+                    remote_time: None,
+                    move_file: false,
+                },
+            ) {
+                let stored_ok = st
+                    .db
+                    .lock()
+                    .unwrap()
+                    .query_row("SELECT path FROM media WHERE id=?1", [mid], |r| r.get::<_, String>(0))
+                    .ok()
+                    .map(|p| Path::new(&p).is_file())
+                    .unwrap_or(false);
+                added += 1;
+                if can_clean && stored_ok {
+                    let _ = std::fs::remove_file(&f);
+                }
+            }
+        } else if is_dat_file(&f) {
+            let mut tmp_rep = ImportReport::default();
+            if let Ok(ingested_or_deduped) = try_ingest_legacy_dat(st, &f, "wechat-watch", &mut tmp_rep) {
+                added += tmp_rep.added;
+                if can_clean && ingested_or_deduped {
+                    let _ = std::fs::remove_file(&f);
+                }
+            }
+        }
+    }
+    Ok(added)
+}
+
+pub fn spawn_wechat_watcher(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            let app_tick = app.clone();
+            let added = tauri::async_runtime::spawn_blocking(move || {
+                let st = app_tick.state::<AppState>();
+                poll_wechat_watch_once(&st).unwrap_or(0)
+            })
+            .await
+            .unwrap_or(0);
+            if added > 0 {
+                let _ = app.emit("watch-imported", added);
+                spawn_processing(app.clone());
+            }
+        }
+    });
 }
 
 // ---------------- background analysis & photo thumbnails ----------------
@@ -290,7 +563,8 @@ pub fn backfill_missing_thumbs(
 pub fn spawn_thumb_backfill(app: AppHandle) {
     tauri::async_runtime::spawn_blocking(move || {
         let st = app.state::<AppState>();
-        let _ = backfill_missing_thumbs(&st.paths, &st.db, |batch| {
+        let paths = st.paths();
+        let _ = backfill_missing_thumbs(&paths, &st.db, |batch| {
             let _ = app.emit("thumbs-updated", batch);
         });
     });
@@ -299,12 +573,113 @@ pub fn spawn_thumb_backfill(app: AppHandle) {
 pub fn ensure_engine(st: &AppState) -> Result<()> {
     let mut g = st.engine.lock().unwrap();
     if g.is_none() {
-        if !download::models_ready(&st.paths) {
+        let paths = st.paths();
+        if !download::models_ready(&paths) {
             bail!("人脸模型尚未下载，请先在「设置」页下载模型");
         }
-        *g = Some(face::FaceEngine::load(&st.paths.models)?);
+        *g = Some(face::FaceEngine::load(&paths.models)?);
     }
     Ok(())
+}
+
+/// Lazily loads `OcrEngine` if OCR ONNX models exist on disk (`ocr_models_ready`).
+pub fn ensure_ocr_engine(st: &AppState) -> Result<bool> {
+    let paths = st.paths();
+    if !download::ocr_models_ready(&paths) {
+        return Ok(false);
+    }
+    let mut g = st.ocr_engine.lock().unwrap();
+    if g.is_none() {
+        *g = Some(ocr::OcrEngine::load(&paths.models)?);
+    }
+    Ok(true)
+}
+
+pub fn analyze_ocr_img(st: &AppState, img: &image::RgbImage) -> Result<Option<Vec<ocr::OcrBox>>> {
+    if !ensure_ocr_engine(st)? {
+        return Ok(None);
+    }
+    let boxes = st
+        .ocr_engine
+        .lock()
+        .unwrap()
+        .as_mut()
+        .ok_or_else(|| anyhow!("OCR 模型未加载"))?
+        .analyze(img)?;
+    Ok(Some(boxes))
+}
+
+/// Backfills OCR results (`ocr_texts` + `media.ocr_done = 1`) for existing analyzed images (`status = 1 AND ocr_done = 0`).
+pub fn backfill_missing_ocr(st: &AppState, mut on_batch: impl FnMut(usize)) -> Result<usize> {
+    if !ensure_ocr_engine(st)? {
+        return Ok(0);
+    }
+    let pending: Vec<(i64, String)> = {
+        let c = st.db.lock().unwrap();
+        let mut s = c.prepare(
+            "SELECT id, path FROM media WHERE kind='image' AND status=1 AND ocr_done=0 ORDER BY id",
+        )?;
+        let rows = s
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    if pending.is_empty() {
+        return Ok(0);
+    }
+
+    let mut total_done = 0usize;
+    for chunk in pending.chunks(8) {
+        let mut batch_res: Vec<(i64, Vec<ocr::OcrBox>)> = Vec::with_capacity(chunk.len());
+        for (id, path) in chunk {
+            let Ok(img) = face::load_image(Path::new(path)) else {
+                // Unreadable image file: mark ocr_done=1 with empty boxes so we don't retry forever.
+                batch_res.push((*id, vec![]));
+                continue;
+            };
+            if let Ok(Some(boxes)) = analyze_ocr_img(st, &img) {
+                batch_res.push((*id, boxes));
+            }
+        }
+        if batch_res.is_empty() {
+            continue;
+        }
+        {
+            let mut c = st.db.lock().unwrap();
+            let tx = c.transaction()?;
+            for (mid, boxes) in &batch_res {
+                tx.execute("DELETE FROM ocr_texts WHERE media_id=?1", [mid])?;
+                for b in boxes {
+                    tx.execute(
+                        "INSERT INTO ocr_texts(media_id,x1,y1,x2,y2,text,norm_text,score) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                        params![mid, b.bbox[0], b.bbox[1], b.bbox[2], b.bbox[3], b.text, b.norm_text, b.score],
+                    )?;
+                }
+                tx.execute("UPDATE media SET ocr_done=1 WHERE id=?1", [mid])?;
+            }
+            tx.commit()?;
+        }
+        total_done += batch_res.len();
+        on_batch(batch_res.len());
+    }
+    Ok(total_done)
+}
+
+pub fn spawn_ocr_backfill(app: AppHandle) {
+    let st = app.state::<AppState>();
+    if !download::ocr_models_ready(&st.paths()) {
+        return;
+    }
+    if st.ocr_backfilling.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let _ = backfill_missing_ocr(&st, |_| {
+            let _ = app.emit("ocr-updated", ());
+        });
+        st.ocr_backfilling.store(false, Ordering::SeqCst);
+    });
 }
 
 pub fn analyze_file(st: &AppState, path: &Path) -> Result<(image::RgbImage, Vec<face::Face>)> {
@@ -334,6 +709,7 @@ pub fn spawn_processing(app: AppHandle) {
         let st = app.state::<AppState>();
         st.processing.store(false, Ordering::SeqCst);
         let _ = app.emit("process-done", r.err().map(|e| format!("{e:#}")));
+        spawn_ocr_backfill(app);
     });
 }
 
@@ -355,17 +731,20 @@ fn process_all(app: &AppHandle) -> Result<()> {
         };
         let Some((id, kind, path, name)) = next else { break };
         let _ = app.emit("progress", Progress { stage: "analyze", done, total: done + remaining as usize, current: name });
-        let res: Result<(Vec<FaceRow>, Option<String>, Option<f64>)> = if kind == "image" {
+        let thumbs_dir = st.paths().thumbs;
+        let res: Result<(Vec<FaceRow>, Option<Vec<ocr::OcrBox>>, Option<String>, Option<f64>)> = if kind == "image" {
             analyze_file(&st, Path::new(&path)).map(|(img, faces)| {
-                let poster = save_image_thumb(&st.paths.thumbs, id, &img).ok();
-                (norm_rows(&img, faces, None), poster, None)
+                let poster = save_image_thumb(&thumbs_dir, id, &img).ok();
+                let ocr_boxes = analyze_ocr_img(&st, &img).ok().flatten();
+                (norm_rows(&img, faces, None), ocr_boxes, poster, None)
             })
         } else {
             analyze_video(&st, ffmpeg.as_deref(), id, Path::new(&path))
+                .map(|(rows, poster, duration)| (rows, Some(vec![]), poster, duration))
         };
         let mut c = st.db.lock().unwrap();
         match res {
-            Ok((rows, poster, duration)) => {
+            Ok((rows, ocr_opt, poster, duration)) => {
                 let tx = c.transaction()?;
                 tx.execute("DELETE FROM faces WHERE media_id=?1", [id])?;
                 for (t, b, s, e) in rows {
@@ -374,9 +753,21 @@ fn process_all(app: &AppHandle) -> Result<()> {
                         params![id, t, b[0], b[1], b[2], b[3], s, db::emb_to_blob(&e)],
                     )?;
                 }
+                let ocr_done_val = if let Some(ocr_boxes) = ocr_opt {
+                    tx.execute("DELETE FROM ocr_texts WHERE media_id=?1", [id])?;
+                    for ob in ocr_boxes {
+                        tx.execute(
+                            "INSERT INTO ocr_texts(media_id,x1,y1,x2,y2,text,norm_text,score) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                            params![id, ob.bbox[0], ob.bbox[1], ob.bbox[2], ob.bbox[3], ob.text, ob.norm_text, ob.score],
+                        )?;
+                    }
+                    1i64
+                } else {
+                    0i64
+                };
                 tx.execute(
-                    "UPDATE media SET status=1, error=NULL, poster=COALESCE(?2,poster), duration=COALESCE(?3,duration) WHERE id=?1",
-                    params![id, poster, duration],
+                    "UPDATE media SET status=1, ocr_done=?4, error=NULL, poster=COALESCE(?2,poster), duration=COALESCE(?3,duration) WHERE id=?1",
+                    params![id, poster, duration, ocr_done_val],
                 )?;
                 tx.commit()?;
             }
@@ -411,7 +802,8 @@ fn run(mut c: Command) -> Result<()> {
 
 pub fn analyze_video(st: &AppState, ffmpeg: Option<&Path>, id: i64, path: &Path) -> Result<(Vec<FaceRow>, Option<String>, Option<f64>)> {
     let ff = ffmpeg.ok_or_else(|| anyhow!("未找到 ffmpeg，无法处理视频（请在「设置」页安装）"))?;
-    let dir = st.paths.tmp.join(format!("v{id}"));
+    let paths = st.paths();
+    let dir = paths.tmp.join(format!("v{id}"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
     let mut c = ffmpeg_cmd(ff);
@@ -428,7 +820,7 @@ pub fn analyze_video(st: &AppState, ffmpeg: Option<&Path>, id: i64, path: &Path)
         rows.extend(norm_rows(&img, faces, Some(n as f64)));
     }
     let poster_src = &frames[frames.len().min(2) - 1];
-    let poster = st.paths.thumbs.join(format!("poster_{id}.jpg"));
+    let poster = paths.thumbs.join(format!("poster_{id}.jpg"));
     face::load_image(poster_src)?
         .pipe(|img| image::DynamicImage::ImageRgb8(img).thumbnail(480, 480))
         .save(&poster)?;
@@ -444,9 +836,9 @@ trait Pipe: Sized {
 }
 impl<T> Pipe for T {}
 
-// ---------------- search ----------------
+// ---------------- search, rejection & purge protection ----------------
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Hit {
     pub media_id: i64,
@@ -456,204 +848,493 @@ pub struct Hit {
     pub poster: Option<String>,
     pub time: String,
     pub score: f32,
-    pub face_id: i64,
+    pub face_id: Option<i64>,
     pub bbox: [f32; 4],
+    pub ocr_id: Option<i64>,
+    pub match_source: String, // "face" | "ocr" | "both"
+    pub ocr_keyword: Option<String>,
+    pub ocr_text: Option<String>,
+    pub ocr_bbox: Option<[f32; 4]>,
     pub duration: Option<f64>,
     pub segments: Vec<[f64; 2]>,
 }
 
 pub fn person_refs(c: &Connection, person_id: i64) -> Result<Vec<Vec<f32>>> {
     let mut s = c.prepare("SELECT embedding FROM refs WHERE person_id=?1")?;
-    let v = s.query_map([person_id], |r| r.get::<_, Vec<u8>>(0))?.flatten().map(|b| db::blob_to_emb(&b)).collect();
+    let v = s
+        .query_map([person_id], |r| r.get::<_, Vec<u8>>(0))?
+        .flatten()
+        .map(|b| db::blob_to_emb(&b))
+        .collect();
     Ok(v)
+}
+
+pub fn person_keywords(c: &Connection, person_id: i64) -> Result<Vec<String>> {
+    let Some((name, aliases)): Option<(String, String)> = c
+        .query_row("SELECT name, aliases FROM persons WHERE id=?1", [person_id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .optional()?
+    else {
+        return Ok(vec![]);
+    };
+    Ok(ocr::build_person_keywords(&name, &aliases))
+}
+
+#[derive(Clone)]
+struct MediaMeta {
+    kind: String,
+    path: String,
+    orig_name: String,
+    poster: Option<String>,
+    time: String,
+    duration: Option<f64>,
+}
+
+struct FaceAcc {
+    score: f32,
+    face_id: i64,
+    bbox: [f32; 4],
+    times: Vec<f64>,
+}
+
+struct OcrAcc {
+    ocr_id: i64,
+    keyword: String,
+    kw_len: usize,
+    text: String,
+    bbox: [f32; 4],
+    score: f32,
+}
+
+fn combine_hit(media_id: i64, meta: MediaMeta, face_acc: Option<FaceAcc>, ocr_acc: Option<OcrAcc>) -> Option<Hit> {
+    match (face_acc, ocr_acc) {
+        (Some(fa), Some(oa)) => {
+            let segments = if meta.kind == "video" { merge_segments(fa.times, meta.duration) } else { vec![] };
+            Some(Hit {
+                media_id,
+                kind: meta.kind,
+                path: meta.path,
+                orig_name: meta.orig_name,
+                poster: meta.poster,
+                time: meta.time,
+                score: fa.score,
+                face_id: Some(fa.face_id),
+                bbox: fa.bbox,
+                ocr_id: Some(oa.ocr_id),
+                match_source: "both".into(),
+                ocr_keyword: Some(oa.keyword),
+                ocr_text: Some(oa.text),
+                ocr_bbox: Some(oa.bbox),
+                duration: meta.duration,
+                segments,
+            })
+        }
+        (Some(fa), None) => {
+            let segments = if meta.kind == "video" { merge_segments(fa.times, meta.duration) } else { vec![] };
+            Some(Hit {
+                media_id,
+                kind: meta.kind,
+                path: meta.path,
+                orig_name: meta.orig_name,
+                poster: meta.poster,
+                time: meta.time,
+                score: fa.score,
+                face_id: Some(fa.face_id),
+                bbox: fa.bbox,
+                ocr_id: None,
+                match_source: "face".into(),
+                ocr_keyword: None,
+                ocr_text: None,
+                ocr_bbox: None,
+                duration: meta.duration,
+                segments,
+            })
+        }
+        (None, Some(oa)) => Some(Hit {
+            media_id,
+            kind: meta.kind,
+            path: meta.path,
+            orig_name: meta.orig_name,
+            poster: meta.poster,
+            time: meta.time,
+            score: oa.score,
+            face_id: None,
+            bbox: oa.bbox,
+            ocr_id: Some(oa.ocr_id),
+            match_source: "ocr".into(),
+            ocr_keyword: Some(oa.keyword),
+            ocr_text: Some(oa.text),
+            ocr_bbox: Some(oa.bbox),
+            duration: meta.duration,
+            segments: vec![],
+        }),
+        (None, None) => None,
+    }
 }
 
 pub fn search(c: &Connection, person_id: i64, threshold: f32) -> Result<Vec<Hit>> {
     let refs = person_refs(c, person_id)?;
-    if refs.is_empty() {
-        bail!("请先给宝宝录入至少一张清晰的正脸照片");
+    let keywords = person_keywords(c, person_id)?;
+    if refs.is_empty() && keywords.is_empty() {
+        bail!("请先给宝宝录入至少一张清晰的正脸照片，或填写至少 2 个字的姓名/署名");
     }
-    let rejected: HashSet<i64> = c
-        .prepare("SELECT face_id FROM rejections WHERE person_id=?1")?
-        .query_map([person_id], |r| r.get(0))?
-        .flatten()
-        .collect();
-    struct Acc {
-        media_id: i64,
-        kind: String,
-        path: String,
-        orig_name: String,
-        poster: Option<String>,
-        time: String,
-        duration: Option<f64>,
-        score: f32,
-        face_id: i64,
-        bbox: [f32; 4],
-        times: Vec<f64>,
+
+    let mut metas: BTreeMap<i64, MediaMeta> = BTreeMap::new();
+    let mut face_map: BTreeMap<i64, FaceAcc> = BTreeMap::new();
+    let mut ocr_map: BTreeMap<i64, OcrAcc> = BTreeMap::new();
+
+    if !refs.is_empty() {
+        let rejected_faces: HashSet<i64> = c
+            .prepare("SELECT face_id FROM rejections WHERE person_id=?1")?
+            .query_map([person_id], |r| r.get(0))?
+            .flatten()
+            .collect();
+
+        let mut s = c.prepare(
+            "SELECT f.id, f.media_id, f.t, f.x1, f.y1, f.x2, f.y2, f.embedding, \
+                    m.kind, m.path, m.orig_name, m.poster, COALESCE(m.remote_time, m.imported_at), m.duration \
+             FROM faces f \
+             JOIN media m ON m.id = f.media_id \
+             WHERE m.status != ?1 \
+             ORDER BY f.media_id, f.id",
+        )?;
+        let mut rows = s.query([storage::STATUS_PURGED])?;
+        while let Some(r) = rows.next()? {
+            let fid: i64 = r.get(0)?;
+            if rejected_faces.contains(&fid) {
+                continue;
+            }
+            let emb = db::blob_to_emb(&r.get::<_, Vec<u8>>(7)?);
+            let sim = refs.iter().map(|q| face::cosine(q, &emb)).fold(f32::MIN, f32::max);
+            if sim < threshold {
+                continue;
+            }
+            let mid: i64 = r.get(1)?;
+            let t: Option<f64> = r.get(2)?;
+            let bbox = [r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?];
+            if !metas.contains_key(&mid) {
+                metas.insert(
+                    mid,
+                    MediaMeta {
+                        kind: r.get(8)?,
+                        path: r.get(9)?,
+                        orig_name: r.get(10)?,
+                        poster: r.get(11)?,
+                        time: r.get(12)?,
+                        duration: r.get(13)?,
+                    },
+                );
+            }
+            match face_map.get_mut(&mid) {
+                None => {
+                    face_map.insert(
+                        mid,
+                        FaceAcc {
+                            score: sim,
+                            face_id: fid,
+                            bbox,
+                            times: t.into_iter().collect(),
+                        },
+                    );
+                }
+                Some(e) => {
+                    if sim > e.score {
+                        e.score = sim;
+                        e.face_id = fid;
+                        e.bbox = bbox;
+                    }
+                    if let Some(ts) = t {
+                        e.times.push(ts);
+                    }
+                }
+            }
+        }
     }
-    let mut acc: Vec<Acc> = Vec::new();
-    let mut s = c.prepare(
-        "SELECT f.id, f.media_id, f.t, f.x1, f.y1, f.x2, f.y2, f.embedding, \
-                m.kind, m.path, m.orig_name, m.poster, COALESCE(m.remote_time, m.imported_at), m.duration \
-         FROM faces f \
-         JOIN media m ON m.id = f.media_id \
-         ORDER BY f.media_id, f.id",
-    )?;
-    let mut rows = s.query([])?;
-    while let Some(r) = rows.next()? {
-        let fid: i64 = r.get(0)?;
-        if rejected.contains(&fid) {
-            continue;
-        }
-        let emb = db::blob_to_emb(&r.get::<_, Vec<u8>>(7)?);
-        let sim = refs.iter().map(|q| face::cosine(q, &emb)).fold(f32::MIN, f32::max);
-        if sim < threshold {
-            continue;
-        }
-        let mid: i64 = r.get(1)?;
-        let t: Option<f64> = r.get(2)?;
-        let bbox = [r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?];
-        let same_media = acc.last().map(|last| last.media_id == mid).unwrap_or(false);
-        if !same_media {
-            acc.push(Acc {
-                media_id: mid,
-                kind: r.get(8)?,
-                path: r.get(9)?,
-                orig_name: r.get(10)?,
-                poster: r.get(11)?,
-                time: r.get(12)?,
-                duration: r.get(13)?,
-                score: sim,
-                face_id: fid,
-                bbox,
-                times: t.into_iter().collect(),
-            });
-        } else if let Some(e) = acc.last_mut() {
-            if sim > e.score {
-                e.score = sim;
-                e.face_id = fid;
-                e.bbox = bbox;
+
+    if !keywords.is_empty() {
+        let rejected_ocr: HashSet<i64> = c
+            .prepare("SELECT ocr_id FROM ocr_rejections WHERE person_id=?1")?
+            .query_map([person_id], |r| r.get(0))?
+            .flatten()
+            .collect();
+
+        let mut s = c.prepare(
+            "SELECT o.id, o.media_id, o.x1, o.y1, o.x2, o.y2, o.text, o.norm_text, o.score, \
+                    m.kind, m.path, m.orig_name, m.poster, COALESCE(m.remote_time, m.imported_at), m.duration \
+             FROM ocr_texts o \
+             JOIN media m ON m.id = o.media_id \
+             WHERE m.status != ?1 AND m.kind = 'image' \
+             ORDER BY o.media_id, o.id",
+        )?;
+        let mut rows = s.query([storage::STATUS_PURGED])?;
+        while let Some(r) = rows.next()? {
+            let oid: i64 = r.get(0)?;
+            if rejected_ocr.contains(&oid) {
+                continue;
             }
-            if let Some(ts) = t {
-                e.times.push(ts);
+            let norm_text: String = r.get(7)?;
+            let Some(kw) = ocr::match_keywords(&norm_text, &keywords) else {
+                continue;
+            };
+            let kw_len = kw.chars().count();
+            let oscore: f32 = r.get(8)?;
+            let mid: i64 = r.get(1)?;
+            let bbox = [r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?];
+            let text: String = r.get(6)?;
+
+            if !metas.contains_key(&mid) {
+                metas.insert(
+                    mid,
+                    MediaMeta {
+                        kind: r.get(9)?,
+                        path: r.get(10)?,
+                        orig_name: r.get(11)?,
+                        poster: r.get(12)?,
+                        time: r.get(13)?,
+                        duration: r.get(14)?,
+                    },
+                );
+            }
+            let replace = match ocr_map.get(&mid) {
+                None => true,
+                Some(prev) => kw_len > prev.kw_len || (kw_len == prev.kw_len && oscore > prev.score),
+            };
+            if replace {
+                ocr_map.insert(
+                    mid,
+                    OcrAcc {
+                        ocr_id: oid,
+                        keyword: kw.to_string(),
+                        kw_len,
+                        text,
+                        bbox,
+                        score: oscore,
+                    },
+                );
             }
         }
     }
-    let mut hits: Vec<Hit> = acc
-        .into_iter()
-        .map(|a| {
-            let segments = if a.kind == "video" { merge_segments(a.times, a.duration) } else { vec![] };
-            Hit {
-                media_id: a.media_id,
-                kind: a.kind,
-                path: a.path,
-                orig_name: a.orig_name,
-                poster: a.poster,
-                time: a.time,
-                score: a.score,
-                face_id: a.face_id,
-                bbox: a.bbox,
-                duration: a.duration,
-                segments,
-            }
-        })
-        .collect();
+
+    let mut hits = Vec::with_capacity(metas.len());
+    for (mid, meta) in metas {
+        if let Some(h) = combine_hit(mid, meta, face_map.remove(&mid), ocr_map.remove(&mid)) {
+            hits.push(h);
+        }
+    }
     hits.sort_by(|a, b| b.time.cmp(&a.time).then_with(|| b.media_id.cmp(&a.media_id)));
     Ok(hits)
 }
 
-/// Records a face rejection for `person_id` and re-scores ONLY that face's `media_id` at `threshold`.
-/// Returns `Ok(Some(updated_hit))` if another non-rejected face on the same photo/video still matches,
-/// or `Ok(None)` when the media item no longer matches.
+/// Records face and/or OCR rejections for `person_id` and surgically re-scores ONLY that `media_id`.
+/// Returns `Ok(Some(updated_hit))` if another face or OCR text on the same media still matches, or `Ok(None)`.
 pub fn reject_and_rescore_media(
     c: &Connection,
-    face_id: i64,
+    face_id: Option<i64>,
+    ocr_id: Option<i64>,
     person_id: i64,
     threshold: f32,
 ) -> Result<Option<Hit>> {
-    c.execute(
-        "INSERT OR IGNORE INTO rejections(face_id, person_id) VALUES(?1, ?2)",
-        params![face_id, person_id],
-    )?;
-    let Some(media_id): Option<i64> = c
-        .query_row("SELECT media_id FROM faces WHERE id=?1", [face_id], |r| r.get(0))
-        .optional()?
-    else {
-        return Ok(None);
-    };
-    let refs = person_refs(c, person_id)?;
-    if refs.is_empty() {
-        return Ok(None);
+    let mut media_id: Option<i64> = None;
+    if let Some(fid) = face_id {
+        c.execute(
+            "INSERT OR IGNORE INTO rejections(face_id, person_id) VALUES(?1, ?2)",
+            params![fid, person_id],
+        )?;
+        media_id = c
+            .query_row("SELECT media_id FROM faces WHERE id=?1", [fid], |r| r.get(0))
+            .optional()?;
     }
-    let rejected: HashSet<i64> = c
-        .prepare(
-            "SELECT r.face_id FROM rejections r JOIN faces f ON f.id = r.face_id WHERE r.person_id=?1 AND f.media_id=?2",
-        )?
-        .query_map(params![person_id, media_id], |r| r.get(0))?
-        .flatten()
-        .collect();
-
-    let mut best_score = f32::MIN;
-    let mut best_face_id: Option<i64> = None;
-    let mut best_bbox = [0.0f32; 4];
-    let mut times: Vec<f64> = Vec::new();
-
-    let mut s = c.prepare("SELECT id, t, x1, y1, x2, y2, embedding FROM faces WHERE media_id=?1 ORDER BY id")?;
-    let mut rows = s.query([media_id])?;
-    while let Some(r) = rows.next()? {
-        let fid: i64 = r.get(0)?;
-        if rejected.contains(&fid) {
-            continue;
-        }
-        let emb = db::blob_to_emb(&r.get::<_, Vec<u8>>(6)?);
-        let sim = refs.iter().map(|q| face::cosine(q, &emb)).fold(f32::MIN, f32::max);
-        if sim < threshold {
-            continue;
-        }
-        if best_face_id.is_none() || sim > best_score {
-            best_score = sim;
-            best_face_id = Some(fid);
-            best_bbox = [r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?];
-        }
-        if let Some(ts) = r.get::<_, Option<f64>>(1)? {
-            times.push(ts);
+    if let Some(oid) = ocr_id {
+        c.execute(
+            "INSERT OR IGNORE INTO ocr_rejections(ocr_id, person_id) VALUES(?1, ?2)",
+            params![oid, person_id],
+        )?;
+        if media_id.is_none() {
+            media_id = c
+                .query_row("SELECT media_id FROM ocr_texts WHERE id=?1", [oid], |r| r.get(0))
+                .optional()?;
         }
     }
-
-    let Some(fid) = best_face_id else {
+    let Some(mid) = media_id else {
         return Ok(None);
     };
-    let Some((kind, path, orig_name, poster, time, duration)): Option<(
-        String,
-        String,
-        String,
-        Option<String>,
-        String,
-        Option<f64>,
-    )> = c
+
+    let Some(meta): Option<MediaMeta> = c
         .query_row(
-            "SELECT kind, path, orig_name, poster, COALESCE(remote_time, imported_at), duration FROM media WHERE id=?1",
-            [media_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            "SELECT kind, path, orig_name, poster, COALESCE(remote_time, imported_at), duration \
+             FROM media WHERE id=?1 AND status != ?2",
+            params![mid, storage::STATUS_PURGED],
+            |r| {
+                Ok(MediaMeta {
+                    kind: r.get(0)?,
+                    path: r.get(1)?,
+                    orig_name: r.get(2)?,
+                    poster: r.get(3)?,
+                    time: r.get(4)?,
+                    duration: r.get(5)?,
+                })
+            },
         )
         .optional()?
     else {
         return Ok(None);
     };
-    let segments = if kind == "video" { merge_segments(times, duration) } else { vec![] };
-    Ok(Some(Hit {
-        media_id,
-        kind,
-        path,
-        orig_name,
-        poster,
-        time,
-        score: best_score,
-        face_id: fid,
-        bbox: best_bbox,
-        duration,
-        segments,
-    }))
+
+    let refs = person_refs(c, person_id)?;
+    let keywords = person_keywords(c, person_id)?;
+
+    let mut face_acc: Option<FaceAcc> = None;
+    if !refs.is_empty() {
+        let rejected: HashSet<i64> = c
+            .prepare(
+                "SELECT r.face_id FROM rejections r JOIN faces f ON f.id = r.face_id WHERE r.person_id=?1 AND f.media_id=?2",
+            )?
+            .query_map(params![person_id, mid], |r| r.get(0))?
+            .flatten()
+            .collect();
+
+        let mut s = c.prepare("SELECT id, t, x1, y1, x2, y2, embedding FROM faces WHERE media_id=?1 ORDER BY id")?;
+        let mut rows = s.query([mid])?;
+        while let Some(r) = rows.next()? {
+            let fid: i64 = r.get(0)?;
+            if rejected.contains(&fid) {
+                continue;
+            }
+            let emb = db::blob_to_emb(&r.get::<_, Vec<u8>>(6)?);
+            let sim = refs.iter().map(|q| face::cosine(q, &emb)).fold(f32::MIN, f32::max);
+            if sim < threshold {
+                continue;
+            }
+            let t: Option<f64> = r.get(1)?;
+            let bbox = [r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?];
+            match face_acc.as_mut() {
+                None => {
+                    face_acc = Some(FaceAcc {
+                        score: sim,
+                        face_id: fid,
+                        bbox,
+                        times: t.into_iter().collect(),
+                    });
+                }
+                Some(acc) => {
+                    if sim > acc.score {
+                        acc.score = sim;
+                        acc.face_id = fid;
+                        acc.bbox = bbox;
+                    }
+                    if let Some(ts) = t {
+                        acc.times.push(ts);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut ocr_acc: Option<OcrAcc> = None;
+    if meta.kind == "image" && !keywords.is_empty() {
+        let rejected_ocr: HashSet<i64> = c
+            .prepare(
+                "SELECT r.ocr_id FROM ocr_rejections r JOIN ocr_texts o ON o.id = r.ocr_id WHERE r.person_id=?1 AND o.media_id=?2",
+            )?
+            .query_map(params![person_id, mid], |r| r.get(0))?
+            .flatten()
+            .collect();
+
+        let mut s = c.prepare(
+            "SELECT id, x1, y1, x2, y2, text, norm_text, score FROM ocr_texts WHERE media_id=?1 ORDER BY id",
+        )?;
+        let mut rows = s.query([mid])?;
+        while let Some(r) = rows.next()? {
+            let oid: i64 = r.get(0)?;
+            if rejected_ocr.contains(&oid) {
+                continue;
+            }
+            let norm_text: String = r.get(6)?;
+            let Some(kw) = ocr::match_keywords(&norm_text, &keywords) else {
+                continue;
+            };
+            let kw_len = kw.chars().count();
+            let oscore: f32 = r.get(7)?;
+            let replace = match ocr_acc.as_ref() {
+                None => true,
+                Some(prev) => kw_len > prev.kw_len || (kw_len == prev.kw_len && oscore > prev.score),
+            };
+            if replace {
+                ocr_acc = Some(OcrAcc {
+                    ocr_id: oid,
+                    keyword: kw.to_string(),
+                    kw_len,
+                    text: r.get(5)?,
+                    bbox: [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?],
+                    score: oscore,
+                });
+            }
+        }
+    }
+
+    Ok(combine_hit(mid, meta, face_acc, ocr_acc))
+}
+
+/// Computes the union of ALL `media_id`s matching ANY enrolled baby via EITHER:
+/// 1) face similarity `>= face_floor` (e.g. `0.32` conservative floor, respecting `rejections`), OR
+/// 2) artwork OCR name/alias match (`ocr::match_keywords`, respecting `ocr_rejections`).
+/// Used by `purge_unmatched_files` so a child's portrait or artwork is NEVER deleted during space cleanup.
+pub fn collect_protected_media_ids(c: &Connection, face_floor: f32) -> Result<HashSet<i64>> {
+    let people: Vec<(i64, String, String)> = c
+        .prepare("SELECT id, name, aliases FROM persons ORDER BY id")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut keep = HashSet::new();
+    for (pid, name, aliases) in people {
+        let refs = person_refs(c, pid)?;
+        let keywords = ocr::build_person_keywords(&name, &aliases);
+
+        if !refs.is_empty() {
+            let rejected: HashSet<i64> = c
+                .prepare("SELECT face_id FROM rejections WHERE person_id=?1")?
+                .query_map([pid], |r| r.get(0))?
+                .flatten()
+                .collect();
+            let mut s = c.prepare("SELECT id, media_id, embedding FROM faces")?;
+            let mut rows = s.query([])?;
+            while let Some(r) = rows.next()? {
+                let fid: i64 = r.get(0)?;
+                let mid: i64 = r.get(1)?;
+                if keep.contains(&mid) || rejected.contains(&fid) {
+                    continue;
+                }
+                let emb = db::blob_to_emb(&r.get::<_, Vec<u8>>(2)?);
+                let sim = refs.iter().map(|q| face::cosine(q, &emb)).fold(f32::MIN, f32::max);
+                if sim >= face_floor {
+                    keep.insert(mid);
+                }
+            }
+        }
+
+        if !keywords.is_empty() {
+            let rejected_ocr: HashSet<i64> = c
+                .prepare("SELECT ocr_id FROM ocr_rejections WHERE person_id=?1")?
+                .query_map([pid], |r| r.get(0))?
+                .flatten()
+                .collect();
+            let mut s = c.prepare("SELECT id, media_id, norm_text FROM ocr_texts")?;
+            let mut rows = s.query([])?;
+            while let Some(r) = rows.next()? {
+                let oid: i64 = r.get(0)?;
+                let mid: i64 = r.get(1)?;
+                if keep.contains(&mid) || rejected_ocr.contains(&oid) {
+                    continue;
+                }
+                let norm_text: String = r.get(2)?;
+                if ocr::match_keywords(&norm_text, &keywords).is_some() {
+                    keep.insert(mid);
+                }
+            }
+        }
+    }
+    Ok(keep)
 }
 
 /// Turn the sampled timestamps (1 fps) where the kid appears into merged clips.
@@ -743,11 +1424,16 @@ pub fn export(app: &AppHandle, out_dir: &Path, items: Vec<ExportItem>, fade: f64
     let mut rep = ExportReport::default();
     let total = items.len();
     for (i, it) in items.into_iter().enumerate() {
-        let row: Option<(String, String, String, String)> = st.db.lock().unwrap().query_row(
-            "SELECT kind, path, orig_name, COALESCE(remote_time, imported_at) FROM media WHERE id=?1",
-            [it.media_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        ).optional()?;
+        let row: Option<(String, String, String, String)> = st
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT kind, path, orig_name, COALESCE(remote_time, imported_at) FROM media WHERE id=?1 AND status != ?2",
+                params![it.media_id, storage::STATUS_PURGED],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
         let Some((kind, path, orig, time)) = row else { continue };
         let _ = app.emit("progress", Progress { stage: "export", done: i, total, current: orig.clone() });
         let src = Path::new(&path);
@@ -794,7 +1480,7 @@ mod tests {
     use crate::Paths;
     use std::collections::HashMap;
     use std::sync::atomic::AtomicBool;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, RwLock};
 
     #[test]
     fn store_file_separates_photos_and_videos_and_keeps_legacy_paths() {
@@ -802,16 +1488,20 @@ mod tests {
         let paths = Paths::new(root.clone()).unwrap();
         let conn = db::open(&paths.data.join("kid-finder.db")).unwrap();
         let st = AppState {
-            paths,
+            app_data_dir: root.clone(),
+            paths: RwLock::new(paths),
             db: Mutex::new(conn),
             engine: Mutex::new(None),
+            ocr_engine: Mutex::new(None),
             processing: AtomicBool::new(false),
+            ocr_backfilling: AtomicBool::new(false),
             bridge_running: AtomicBool::new(false),
             web_cache: Mutex::new(HashMap::new()),
         };
 
-        let src_img = st.paths.tmp.join("sample.jpg");
-        let src_vid = st.paths.tmp.join("sample.mp4");
+        let cur_paths = st.paths();
+        let src_img = cur_paths.tmp.join("sample.jpg");
+        let src_vid = cur_paths.tmp.join("sample.mp4");
         std::fs::write(&src_img, b"fake-jpeg-bytes").unwrap();
         std::fs::write(&src_vid, b"fake-mp4-bytes").unwrap();
         let sha_img = sha256_file(&src_img).unwrap();
@@ -847,8 +1537,8 @@ mod tests {
         )
         .unwrap();
 
-        let expected_img = st.paths.library.join("photos").join(&sha_img[..2]).join(format!("{sha_img}.jpg"));
-        let expected_vid = st.paths.library.join("videos").join(&sha_vid[..2]).join(format!("{sha_vid}.mp4"));
+        let expected_img = cur_paths.library.join("photos").join(&sha_img[..2]).join(format!("{sha_img}.jpg"));
+        let expected_vid = cur_paths.library.join("videos").join(&sha_vid[..2]).join(format!("{sha_vid}.mp4"));
         assert!(expected_img.is_file());
         assert!(expected_vid.is_file());
 
@@ -859,7 +1549,7 @@ mod tests {
         assert_eq!(PathBuf::from(&db_vid_path), expected_vid);
 
         // Verify backward compatibility with pre-existing legacy rows under library/<sha2>/...
-        let legacy_dir = st.paths.library.join("ab");
+        let legacy_dir = cur_paths.library.join("ab");
         std::fs::create_dir_all(&legacy_dir).unwrap();
         let legacy_file = legacy_dir.join("abcdef123456.jpg");
         std::fs::write(&legacy_file, b"legacy-img").unwrap();
@@ -928,7 +1618,6 @@ mod tests {
             )
             .unwrap();
         }
-        // Add one newer timestamp row to verify primary sort is still `time DESC`
         conn.execute(
             "INSERT INTO media(sha256,kind,path,orig_name,source,imported_at,status) VALUES('sha_newer','image','/tmp/NEW.JPG','NEW.JPG','local','2026-11-20 20:55:00',1)",
             [],
@@ -969,7 +1658,6 @@ mod tests {
         )
         .unwrap();
 
-        // Single-face photo
         conn.execute(
             "INSERT INTO media(sha256,kind,path,orig_name,poster,source,imported_at,status) VALUES('sha_single','image','/tmp/s.jpg','s.jpg','/tmp/thumb_s.jpg','local','2026-11-20 20:51:29',1)",
             [],
@@ -983,7 +1671,6 @@ mod tests {
         .unwrap();
         let fid_single = conn.last_insert_rowid();
 
-        // Multi-face photo (2 faces above 0.44 threshold)
         conn.execute(
             "INSERT INTO media(sha256,kind,path,orig_name,poster,source,imported_at,status) VALUES('sha_multi','image','/tmp/m.jpg','m.jpg','/tmp/thumb_m.jpg','local','2026-11-20 20:51:29',1)",
             [],
@@ -1003,26 +1690,205 @@ mod tests {
         .unwrap();
         let fid_multi_second = conn.last_insert_rowid();
 
-        // Reject single-face photo -> None
-        let r_single = reject_and_rescore_media(&conn, fid_single, pid, 0.44).unwrap();
+        let r_single = reject_and_rescore_media(&conn, Some(fid_single), None, pid, 0.44).unwrap();
         assert!(r_single.is_none());
 
-        // Reject best face on multi-face photo -> falls back to second face!
-        let r_multi_1 = reject_and_rescore_media(&conn, fid_multi_best, pid, 0.44)
+        let r_multi_1 = reject_and_rescore_media(&conn, Some(fid_multi_best), None, pid, 0.44)
             .unwrap()
             .expect("second matching face should remain");
         assert_eq!(r_multi_1.media_id, mid_multi);
-        assert_eq!(r_multi_1.face_id, fid_multi_second);
+        assert_eq!(r_multi_1.face_id, Some(fid_multi_second));
+        assert_eq!(r_multi_1.match_source, "face");
         assert!((r_multi_1.score - 0.62).abs() < 1e-4);
         assert_eq!(r_multi_1.poster.as_deref(), Some("/tmp/thumb_m.jpg"));
 
-        // Reject second face -> None
-        let r_multi_2 = reject_and_rescore_media(&conn, fid_multi_second, pid, 0.44).unwrap();
+        let r_multi_2 = reject_and_rescore_media(&conn, Some(fid_multi_second), None, pid, 0.44).unwrap();
         assert!(r_multi_2.is_none());
         assert!(search(&conn, pid, 0.44).unwrap().is_empty());
 
         drop(conn);
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn combined_face_and_ocr_search_zero_ref_fallback_and_surgical_rejection() {
+        let tmp = std::env::temp_dir().join(format!("kid_finder_ocr_search_{}.db", uuid::Uuid::new_v4()));
+        let conn = db::open(&tmp).unwrap();
+        conn.execute(
+            "INSERT INTO persons(name, aliases, created_at) VALUES('韩梓淏', '梓淏, 小淏', '2026-11-21 10:00:00')",
+            [],
+        )
+        .unwrap();
+        let pid = conn.last_insert_rowid();
+
+        // Photo 1: pure artwork OCR match (`"大二班 梓淏"`), ZERO faces!
+        conn.execute(
+            "INSERT INTO media(sha256,kind,path,orig_name,source,imported_at,status,ocr_done) VALUES('sha_art1','image','/tmp/art1.jpg','art1.jpg','local','2026-11-21 10:01:00',1,1)",
+            [],
+        )
+        .unwrap();
+        let mid_art = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO ocr_texts(media_id,x1,y1,x2,y2,text,norm_text,score) VALUES(?1,0.6,0.8,0.9,0.92,'大二班 梓淏','大二班梓淏',0.95)",
+            [mid_art],
+        )
+        .unwrap();
+        let oid_art = conn.last_insert_rowid();
+
+        // Even BEFORE any face reference photo is enrolled (`refs` is empty!), artwork OCR search succeeds!
+        let hits_no_ref = search(&conn, pid, 0.40).unwrap();
+        assert_eq!(hits_no_ref.len(), 1);
+        assert_eq!(hits_no_ref[0].media_id, mid_art);
+        assert_eq!(hits_no_ref[0].match_source, "ocr");
+        assert_eq!(hits_no_ref[0].face_id, None);
+        assert_eq!(hits_no_ref[0].ocr_id, Some(oid_art));
+        assert_eq!(hits_no_ref[0].ocr_keyword.as_deref(), Some("梓淏"));
+
+        // Enrol face reference `[1.0, 0.0]`
+        conn.execute(
+            "INSERT INTO refs(person_id, embedding, thumb, source, created_at) VALUES(?1,?2,NULL,'test','2026-11-21 10:02:00')",
+            params![pid, db::emb_to_blob(&[1.0f32, 0.0f32])],
+        )
+        .unwrap();
+
+        // Photo 2: BOTH face match AND full-name OCR match (`"姓名：韩梓淏"`)
+        conn.execute(
+            "INSERT INTO media(sha256,kind,path,orig_name,source,imported_at,status,ocr_done) VALUES('sha_both','image','/tmp/both.jpg','both.jpg','local','2026-11-21 10:03:00',1,1)",
+            [],
+        )
+        .unwrap();
+        let mid_both = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO faces(media_id,t,x1,y1,x2,y2,score,embedding) VALUES(?1,NULL,0.2,0.1,0.4,0.4,0.96,?2)",
+            params![mid_both, db::emb_to_blob(&[0.88f32, 0.47497f32])],
+        )
+        .unwrap();
+        let fid_both = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO ocr_texts(media_id,x1,y1,x2,y2,text,norm_text,score) VALUES(?1,0.5,0.7,0.85,0.82,'姓名：韩梓淏','姓名韩梓淏',0.97)",
+            [mid_both],
+        )
+        .unwrap();
+        let oid_both = conn.last_insert_rowid();
+
+        let hits = search(&conn, pid, 0.45).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].media_id, mid_both);
+        assert_eq!(hits[0].match_source, "both");
+        assert_eq!(hits[0].face_id, Some(fid_both));
+        assert_eq!(hits[0].ocr_id, Some(oid_both));
+        assert_eq!(hits[0].ocr_keyword.as_deref(), Some("韩梓淏")); // longest keyword
+
+        // Cranking face threshold up to 0.99 must NOT drop OCR artwork matches!
+        let hits_strict = search(&conn, pid, 0.99).unwrap();
+        assert_eq!(hits_strict.len(), 2);
+        assert!(hits_strict.iter().all(|h| h.match_source == "ocr"));
+
+        // Rejecting BOTH face & OCR on `mid_both` removes `mid_both` cleanly
+        let after_both_reject =
+            reject_and_rescore_media(&conn, Some(fid_both), Some(oid_both), pid, 0.45).unwrap();
+        assert!(after_both_reject.is_none());
+
+        // Rejecting OCR on `mid_art` removes `mid_art` cleanly
+        let after_art_reject = reject_and_rescore_media(&conn, None, Some(oid_art), pid, 0.45).unwrap();
+        assert!(after_art_reject.is_none());
+        assert!(search(&conn, pid, 0.45).unwrap().is_empty());
+
+        drop(conn);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn ocr_protected_purge_never_deletes_baby_artwork_or_external_wechat_videos() {
+        let tmp = std::env::temp_dir().join(format!("kid_finder_ocr_purge_{}", uuid::Uuid::new_v4()));
+        let library_dir = tmp.join("library");
+        let thumbs_dir = tmp.join("thumbs");
+        let xwechat_dir = tmp.join("xwechat_files").join("wxid_abc").join("msg").join("video");
+        std::fs::create_dir_all(library_dir.join("photos/aa")).unwrap();
+        std::fs::create_dir_all(&thumbs_dir).unwrap();
+        std::fs::create_dir_all(&xwechat_dir).unwrap();
+
+        let mut conn = db::open(&tmp.join("kid-finder.db")).unwrap();
+        // Baby 1: face ref; Baby 2: artwork name/alias only (`韩梓淏` / `梓淏`)
+        conn.execute("INSERT INTO persons(name, aliases, created_at) VALUES('朵朵', '', '2026-11-21 10:00:00')", [])
+            .unwrap();
+        let pid1 = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO refs(person_id, embedding, thumb, source, created_at) VALUES(?1,?2,NULL,'test','2026-11-21 10:00:00')",
+            params![pid1, db::emb_to_blob(&[1.0f32, 0.0f32])],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO persons(name, aliases, created_at) VALUES('韩梓淏', '梓淏', '2026-11-21 10:00:00')", [])
+            .unwrap();
+
+        // 1) Managed portrait matching Baby 1 at conservative floor (0.35 >= 0.32) -> KEEP
+        let f_face = library_dir.join("photos/aa/face_hit.jpg");
+        std::fs::write(&f_face, vec![1u8; 512]).unwrap();
+        conn.execute(
+            "INSERT INTO media(sha256,kind,path,orig_name,source,imported_at,status,ocr_done) VALUES('s_face','image',?1,'face.jpg','local','2026-11-21 10:01:00',1,1)",
+            params![f_face.to_string_lossy()],
+        )
+        .unwrap();
+        let mid_face = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO faces(media_id,t,x1,y1,x2,y2,score,embedding) VALUES(?1,NULL,0.1,0.1,0.4,0.4,0.9,?2)",
+            params![mid_face, db::emb_to_blob(&[0.35f32, 0.93675f32])],
+        )
+        .unwrap();
+
+        // 2) Managed artwork with 0 faces but OCR `"大二班 梓淏"` matching Baby 2 -> KEEP!
+        let f_art = library_dir.join("photos/aa/artwork_zihao.jpg");
+        std::fs::write(&f_art, vec![2u8; 1024]).unwrap();
+        conn.execute(
+            "INSERT INTO media(sha256,kind,path,orig_name,source,imported_at,status,ocr_done) VALUES('s_art','image',?1,'art.jpg','local','2026-11-21 10:02:00',1,1)",
+            params![f_art.to_string_lossy()],
+        )
+        .unwrap();
+        let mid_art = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO ocr_texts(media_id,x1,y1,x2,y2,text,norm_text,score) VALUES(?1,0.2,0.8,0.6,0.9,'大二班 梓淏','大二班梓淏',0.93)",
+            [mid_art],
+        )
+        .unwrap();
+
+        // 3) Managed unmatched photo (other child's face + other child's OCR `"王玥萱"`) -> PURGE
+        let f_other = library_dir.join("photos/aa/other_kid.jpg");
+        std::fs::write(&f_other, vec![3u8; 2048]).unwrap();
+        conn.execute(
+            "INSERT INTO media(sha256,kind,path,orig_name,source,imported_at,status,ocr_done) VALUES('s_other','image',?1,'other.jpg','local','2026-11-21 10:03:00',1,1)",
+            params![f_other.to_string_lossy()],
+        )
+        .unwrap();
+        let mid_other = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO ocr_texts(media_id,x1,y1,x2,y2,text,norm_text,score) VALUES(?1,0.2,0.8,0.6,0.9,'王玥萱','王玥萱',0.96)",
+            [mid_other],
+        )
+        .unwrap();
+
+        // 4) Unmatched external in-place WeChat video -> NEVER deleted!
+        let f_wx_vid = xwechat_dir.join("class_video.mp4");
+        std::fs::write(&f_wx_vid, vec![4u8; 4096]).unwrap();
+        store_external_file(&conn, &f_wx_vid, "s_wx_vid", "video", "class_video.mp4", "wechat-local").unwrap();
+        conn.execute("UPDATE media SET status=1, ocr_done=1 WHERE sha256='s_wx_vid'", []).unwrap();
+
+        let keep = collect_protected_media_ids(&conn, PURGE_CONSERVATIVE_FACE_FLOOR).unwrap();
+        assert!(keep.contains(&mid_face));
+        assert!(keep.contains(&mid_art));
+        assert!(!keep.contains(&mid_other));
+
+        let rep = storage::purge_unmatched_files(&mut conn, &library_dir, &keep).unwrap();
+        assert_eq!(rep.purged_count, 1);
+        assert_eq!(rep.skipped_kept, 2);
+        assert_eq!(rep.skipped_external, 1);
+
+        assert!(f_face.is_file(), "portrait match must remain on disk");
+        assert!(f_art.is_file(), "OCR artwork match must remain on disk");
+        assert!(!f_other.exists(), "unmatched managed file should be reclaimed");
+        assert!(f_wx_vid.is_file(), "external xwechat_files video must never be deleted");
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -1066,7 +1932,6 @@ mod tests {
             .unwrap();
         assert_eq!(db_poster.as_deref(), poster_path.to_str());
 
-        // Second backfill run is a no-op since poster is now populated
         let count_again = backfill_missing_thumbs(&paths, &db_mutex, |_| {}).unwrap();
         assert_eq!(count_again, 0);
 
