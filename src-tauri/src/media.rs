@@ -5,12 +5,12 @@ use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -827,6 +827,109 @@ pub fn analyze_video(st: &AppState, ffmpeg: Option<&Path>, id: i64, path: &Path)
     let duration = frames.len() as f64;
     let _ = std::fs::remove_dir_all(&dir);
     Ok((rows, Some(poster.to_string_lossy().to_string()), Some(duration)))
+}
+
+static PREVIEW_LOCKS: OnceLock<Mutex<HashMap<i64, Arc<Mutex<()>>>>> = OnceLock::new();
+
+fn preview_lock_for(media_id: i64) -> Arc<Mutex<()>> {
+    let map = PREVIEW_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap();
+    guard.entry(media_id).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+}
+
+fn preview_transcode_cmd(ff: &Path, src: &Path, with_audio: bool, dest: &Path) -> Command {
+    let mut c = ffmpeg_cmd(ff);
+    c.arg("-y").arg("-i").arg(src).args(["-map", "0:v:0"]);
+    if with_audio {
+        c.args(["-map", "0:a:0?"]);
+    } else {
+        c.arg("-an");
+    }
+    c.args([
+        "-vf",
+        "scale='min(960,iw)':-2",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "25",
+        "-pix_fmt",
+        "yuv420p",
+    ]);
+    if with_audio {
+        c.args(["-c:a", "aac", "-ac", "2"]);
+    }
+    c.args(["-movflags", "+faststart", "-f", "mp4"]).arg(dest);
+    c
+}
+
+/// Generates (or reuses) a fast-seeking H.264/AAC MP4 preview proxy at `thumbs/preview_{media_id}.mp4`
+/// for videos whose native codec (e.g. HEVC `hvc1` / `.mov`) cannot be decoded by Windows WebView2.
+/// Never modifies `media.path`, so final clip export always cuts from the original high-quality video.
+pub fn prepare_video_preview(st: &AppState, media_id: i64) -> Result<String> {
+    let per_id_lock = preview_lock_for(media_id);
+    let _serial = per_id_lock.lock().unwrap();
+
+    let row: Option<(String, String, i64)> = {
+        let c = st.db.lock().unwrap();
+        c.query_row(
+            "SELECT kind, path, status FROM media WHERE id=?1",
+            [media_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?
+    };
+    let Some((kind, path, status)) = row else {
+        bail!("未找到对应的视频记录 (ID: {media_id})");
+    };
+    if kind != "video" {
+        bail!("该记录不是视频文件 (ID: {media_id})");
+    }
+    if status == storage::STATUS_PURGED {
+        bail!("该视频原片已被清理释放空间，无法生成预览");
+    }
+
+    let thumbs_dir = st.paths().thumbs;
+    std::fs::create_dir_all(&thumbs_dir)?;
+    let dest = thumbs_dir.join(format!("preview_{media_id}.mp4"));
+    if dest.metadata().map(|m| m.is_file() && m.len() > 0).unwrap_or(false) {
+        return Ok(dest.to_string_lossy().to_string());
+    }
+
+    let src_path = PathBuf::from(&path);
+    if !src_path.is_file() {
+        bail!("找不到原视频文件（可能已被移动或清理）：{}", src_path.display());
+    }
+
+    let ff = download::find_ffmpeg(st).ok_or_else(|| {
+        anyhow!("未找到 ffmpeg，无法转码 H.265/特殊编码视频（请在「④ 宝宝视频」或「设置」一键安装 ffmpeg）")
+    })?;
+
+    let tmp_dest = thumbs_dir.join(format!("preview_{media_id}.part.{}.mp4", uuid::Uuid::new_v4()));
+    let transcode_res = (|| -> Result<()> {
+        if run(preview_transcode_cmd(&ff, &src_path, true, &tmp_dest)).is_err() {
+            let _ = std::fs::remove_file(&tmp_dest);
+            run(preview_transcode_cmd(&ff, &src_path, false, &tmp_dest))?;
+        }
+        let len = std::fs::metadata(&tmp_dest).map(|m| m.len()).unwrap_or(0);
+        if len == 0 {
+            bail!("ffmpeg 生成的兼容预览文件为空");
+        }
+        Ok(())
+    })();
+    if let Err(e) = transcode_res {
+        let _ = std::fs::remove_file(&tmp_dest);
+        return Err(e);
+    }
+    if dest.exists() {
+        let _ = std::fs::remove_file(&dest);
+    }
+    if let Err(e) = std::fs::rename(&tmp_dest, &dest) {
+        let _ = std::fs::remove_file(&tmp_dest);
+        return Err(e).context("保存兼容预览视频失败");
+    }
+    Ok(dest.to_string_lossy().to_string())
 }
 
 trait Pipe: Sized {
@@ -1936,6 +2039,64 @@ mod tests {
         assert_eq!(count_again, 0);
 
         drop(db_mutex);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prepare_video_preview_reuses_cached_proxy_validates_rows_and_preserves_original_media_path() {
+        let root = std::env::temp_dir().join(format!("kid_finder_preview_test_{}", uuid::Uuid::new_v4()));
+        let paths = Paths::new(root.clone()).unwrap();
+        let conn = db::open(&paths.data.join("kid-finder.db")).unwrap();
+        let st = AppState {
+            app_data_dir: root.clone(),
+            paths: RwLock::new(paths.clone()),
+            db: Mutex::new(conn),
+            engine: Mutex::new(None),
+            ocr_engine: Mutex::new(None),
+            processing: AtomicBool::new(false),
+            ocr_backfilling: AtomicBool::new(false),
+            bridge_running: AtomicBool::new(false),
+            web_cache: Mutex::new(HashMap::new()),
+        };
+
+        let orig_video = paths.library.join("orig_hevc.mp4");
+        std::fs::write(&orig_video, b"original-high-quality-hevc-bytes").unwrap();
+        let vid_id = {
+            let c = st.db.lock().unwrap();
+            c.execute(
+                "INSERT INTO media(sha256,kind,path,orig_name,source,imported_at,status) VALUES('sha_hv','video',?1,'orig.mp4','wechat-local','2026-11-21 10:00:00',1)",
+                params![orig_video.to_string_lossy()],
+            )
+            .unwrap();
+            let vid = c.last_insert_rowid();
+            c.execute(
+                "INSERT INTO media(sha256,kind,path,orig_name,source,imported_at,status) VALUES('sha_im','image',?1,'img.jpg','local','2026-11-21 10:00:00',1)",
+                params![orig_video.to_string_lossy()],
+            )
+            .unwrap();
+            vid
+        };
+        let img_id = vid_id + 1;
+
+        // Rejects unknown ID and image rows
+        assert!(prepare_video_preview(&st, 999_999).is_err());
+        assert!(prepare_video_preview(&st, img_id).is_err());
+
+        // Reuses existing non-empty cached preview proxy without modifying `media.path`
+        let cached_preview = paths.thumbs.join(format!("preview_{vid_id}.mp4"));
+        std::fs::write(&cached_preview, b"cached-h264-proxy").unwrap();
+        let got = prepare_video_preview(&st, vid_id).unwrap();
+        assert_eq!(PathBuf::from(&got), cached_preview);
+
+        let db_path_after: String = st
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT path FROM media WHERE id=?1", [vid_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(PathBuf::from(db_path_after), orig_video);
+
+        drop(st);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -9,6 +9,7 @@ import Guide, { WechatImportGuide } from "./Guide";
 import {
   api,
   src,
+  videoStreamUrl,
   fmtTime,
   fmtBytes,
   deriveDefaultAliases,
@@ -1635,6 +1636,8 @@ function VideosView({
           <div onClick={(e) => e.stopPropagation()}>
             <VideoPreview
               hit={preview.hit}
+              bridgePort={status.bridgePort}
+              bridgeRunning={status.bridgeRunning}
               segs={segsOf(preview.hit)}
               initialRange={preview.initialRange}
               edited={editKey(preview.hit.mediaId) in edits}
@@ -1665,12 +1668,16 @@ function VideosView({
 
 function VideoPreview({
   hit,
+  bridgePort,
+  bridgeRunning,
   segs,
   initialRange,
   edited,
   onChange,
 }: {
   hit: Hit;
+  bridgePort: number;
+  bridgeRunning: boolean;
   segs: [number, number][];
   initialRange?: [number, number] | null;
   edited: boolean;
@@ -1678,13 +1685,48 @@ function VideoPreview({
 }) {
   const ref = useRef<HTMLVideoElement>(null);
   const stopAt = useRef<number | null>(null);
+  const activeMediaIdRef = useRef<number>(hit.mediaId);
+  activeMediaIdRef.current = hit.mediaId;
+  const fallbackTriedRef = useRef<number | null>(null);
+  const metadataLoadedRef = useRef(false);
+  const pendingSeekRef = useRef<{ time: number; stop: number | null; autoPlay: boolean } | null>(null);
+
+  const [usePreviewProxy, setUsePreviewProxy] = useState(false);
+  const [previewLocalPath, setPreviewLocalPath] = useState<string | null>(null);
+  const [cacheBust, setCacheBust] = useState<number | undefined>(undefined);
+  const [transcoding, setTranscoding] = useState(false);
+  const [videoError, setVideoError] = useState<string | null>(null);
+
+  useEffect(() => {
+    stopAt.current = null;
+    fallbackTriedRef.current = null;
+    metadataLoadedRef.current = false;
+    pendingSeekRef.current = null;
+    setUsePreviewProxy(false);
+    setPreviewLocalPath(null);
+    setCacheBust(undefined);
+    setTranscoding(false);
+    setVideoError(null);
+  }, [hit.mediaId]);
+
+  const videoUrl = useMemo(() => {
+    if (bridgeRunning && bridgePort > 0) {
+      return videoStreamUrl(bridgePort, hit.mediaId, usePreviewProxy, cacheBust);
+    }
+    return src(usePreviewProxy && previewLocalPath ? previewLocalPath : hit.path);
+  }, [bridgeRunning, bridgePort, hit.mediaId, hit.path, usePreviewProxy, previewLocalPath, cacheBust]);
+
   const now = () => Math.round((ref.current?.currentTime ?? 0) * 10) / 10;
   const play = (a: number, b?: number) => {
     const v = ref.current;
-    if (!v) return;
+    if (!v || transcoding || videoError) return;
+    if (!metadataLoadedRef.current || v.readyState < 1) {
+      pendingSeekRef.current = { time: a, stop: b ?? null, autoPlay: true };
+      return;
+    }
     stopAt.current = b ?? null;
     v.currentTime = a;
-    v.play();
+    v.play().catch(() => {});
   };
   const set = (i: number, seg: [number, number]) => {
     const n = segs.map((s, k) => (k === i ? seg : s));
@@ -1692,19 +1734,97 @@ function VideoPreview({
   };
   return (
     <>
+      {transcoding && (
+        <div
+          style={{
+            minWidth: 520,
+            maxWidth: "86vw",
+            minHeight: 280,
+            background: "#111827",
+            color: "#f9fafb",
+            borderRadius: 8,
+            display: "grid",
+            placeItems: "center",
+            padding: 24,
+            textAlign: "center",
+          }}
+        >
+          <div>
+            <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 6 }}>
+              检测到 H.265/特殊编码，正在用 ffmpeg 生成兼容预览…
+            </div>
+            <div className="small" style={{ color: "#9ca3af" }}>
+              首次打开会自动生成快速预览缓存（不影响裁剪导出原画质），请稍候几秒
+            </div>
+          </div>
+        </div>
+      )}
+      {videoError && !transcoding && (
+        <div className="ffmpeg-banner" style={{ marginBottom: 0, maxWidth: "86vw" }}>
+          <span>
+            <b>视频预览失败：</b>
+            {videoError}
+          </span>
+          <div className="spacer" />
+          <button className="ghost small" onClick={() => openPath(hit.path).catch(() => {})}>
+            用系统默认播放器打开
+          </button>
+        </div>
+      )}
       <video
         ref={ref}
-        src={src(hit.path)}
+        src={videoUrl}
+        poster={hit.poster ? src(hit.poster) : undefined}
         controls
         autoPlay
+        preload="metadata"
+        style={{ display: transcoding || videoError ? "none" : "block" }}
         onLoadedMetadata={() => {
-          if (!ref.current) return;
+          metadataLoadedRef.current = true;
+          const v = ref.current;
+          if (!v) return;
+          if (pendingSeekRef.current) {
+            const p = pendingSeekRef.current;
+            pendingSeekRef.current = null;
+            stopAt.current = p.stop;
+            v.currentTime = p.time;
+            if (p.autoPlay) v.play().catch(() => {});
+            return;
+          }
           if (initialRange) {
             stopAt.current = initialRange[1];
-            ref.current.currentTime = initialRange[0];
+            v.currentTime = initialRange[0];
           } else {
-            ref.current.currentTime = segs[0]?.[0] ?? 0;
+            stopAt.current = null;
+            v.currentTime = segs[0]?.[0] ?? 0;
           }
+          v.play().catch(() => {});
+        }}
+        onError={() => {
+          if (transcoding) return;
+          if (fallbackTriedRef.current !== hit.mediaId && !usePreviewProxy) {
+            fallbackTriedRef.current = hit.mediaId;
+            metadataLoadedRef.current = false;
+            setVideoError(null);
+            setTranscoding(true);
+            const targetId = hit.mediaId;
+            api
+              .prepareVideoPreview(targetId)
+              .then((localPath) => {
+                if (activeMediaIdRef.current !== targetId) return;
+                setPreviewLocalPath(localPath);
+                setCacheBust(Date.now());
+                setUsePreviewProxy(true);
+                setTranscoding(false);
+              })
+              .catch((err) => {
+                if (activeMediaIdRef.current !== targetId) return;
+                setTranscoding(false);
+                setVideoError(String(err));
+              });
+            return;
+          }
+          setVideoError("当前系统解码器无法播放该视频，可点击右侧按钮使用系统播放器打开，或直接裁剪导出 H.264 片段。");
         }}
         onTimeUpdate={() => {
           const v = ref.current;

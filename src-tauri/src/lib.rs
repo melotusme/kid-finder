@@ -557,6 +557,11 @@ async fn export(app: AppHandle, out_dir: String, items: Vec<media::ExportItem>, 
     blocking(move || media::export(&app, Path::new(&out_dir), items, fade.unwrap_or(0.0))).await
 }
 
+#[tauri::command]
+async fn prepare_video_preview(app: AppHandle, media_id: i64) -> CmdResult<String> {
+    blocking(move || media::prepare_video_preview(&app.state::<AppState>(), media_id)).await
+}
+
 // ---------------- storage stats, migration & space reclamation ----------------
 
 #[tauri::command]
@@ -741,6 +746,7 @@ pub fn run() {
             reject_face,
             reject_hit,
             export,
+            prepare_video_preview,
             get_storage_stats,
             migrate_storage,
             purge_unmatched,

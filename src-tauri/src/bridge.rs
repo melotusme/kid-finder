@@ -11,12 +11,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 pub const BRIDGE_PORT: u16 = 27431;
@@ -24,6 +25,7 @@ const MAX_HEADER_BYTES: usize = 32 * 1024;
 const MAX_BODY_BYTES: usize = 25 * 1024 * 1024;
 const MAX_VIDEO_BYTES: u64 = 500 * 1024 * 1024;
 const MAX_CACHE_ENTRIES: usize = 4000;
+const VIDEO_STREAM_CHUNK: usize = 64 * 1024;
 
 /// Cached per-item faces: list of `(normalized [x1,y1,x2,y2], 512-d L2-normalized embedding)`.
 pub type CachedFaces = Vec<([f32; 4], Vec<f32>)>;
@@ -84,10 +86,11 @@ async fn handle_conn(app: AppHandle, mut stream: TcpStream) -> Result<()> {
     let mut parts = first.split_whitespace();
     let method = parts.next().unwrap_or("");
     let raw_path = parts.next().unwrap_or("/");
-    let path = raw_path.split('?').next().unwrap_or("/");
+    let (path, query) = raw_path.split_once('?').unwrap_or((raw_path, ""));
 
     let mut content_len: usize = 0;
     let mut origin: Option<String> = None;
+    let mut range_header: Option<String> = None;
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
             let kl = k.trim().to_ascii_lowercase();
@@ -96,6 +99,8 @@ async fn handle_conn(app: AppHandle, mut stream: TcpStream) -> Result<()> {
                 content_len = vt.parse().unwrap_or(0);
             } else if kl == "origin" {
                 origin = Some(vt.to_string());
+            } else if kl == "range" {
+                range_header = Some(vt.to_string());
             }
         }
     }
@@ -103,6 +108,21 @@ async fn handle_conn(app: AppHandle, mut stream: TcpStream) -> Result<()> {
     let cors_origin = allowed_origin(origin.as_deref());
     if method == "OPTIONS" {
         write_response(&mut stream, 204, cors_origin, &Value::Null).await?;
+        return Ok(());
+    }
+
+    if matches!(method, "GET" | "HEAD") && path.starts_with("/api/video/") {
+        let id_segment = &path["/api/video/".len()..];
+        handle_video_request(
+            &app,
+            &mut stream,
+            method == "HEAD",
+            id_segment,
+            query,
+            range_header.as_deref(),
+            cors_origin,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -193,7 +213,17 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 
 fn allowed_origin(origin: Option<&str>) -> Option<&str> {
     let o = origin?;
-    if o.starts_with("chrome-extension://") || o == "https://qxc.hi.cn" {
+    if o.starts_with("chrome-extension://")
+        || matches!(
+            o,
+            "https://qxc.hi.cn"
+                | "http://tauri.localhost"
+                | "https://tauri.localhost"
+                | "tauri://localhost"
+                | "http://localhost:5173"
+                | "http://127.0.0.1:5173"
+        )
+    {
         Some(o)
     } else {
         None
@@ -201,18 +231,29 @@ fn allowed_origin(origin: Option<&str>) -> Option<&str> {
 }
 
 async fn write_response(stream: &mut TcpStream, status: u16, origin: Option<&str>, body: &Value) -> Result<()> {
+    write_json_response(stream, status, origin, body, false).await
+}
+
+async fn write_json_response(
+    stream: &mut TcpStream,
+    status: u16,
+    origin: Option<&str>,
+    body: &Value,
+    head_only: bool,
+) -> Result<()> {
     let reason = match status {
         200 => "OK",
         204 => "No Content",
         400 => "Bad Request",
         404 => "Not Found",
         413 => "Payload Too Large",
+        416 => "Range Not Satisfiable",
         431 => "Request Header Fields Too Large",
         _ => "Internal Server Error",
     };
     let bytes = if status == 204 { Vec::new() } else { serde_json::to_vec(body)? };
     let mut head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nAccess-Control-Allow-Private-Network: true\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Methods: GET, HEAD, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Range\r\nAccess-Control-Expose-Headers: Accept-Ranges, Content-Range, Content-Length\r\nAccess-Control-Allow-Private-Network: true\r\n",
         bytes.len()
     );
     if let Some(o) = origin {
@@ -220,10 +261,338 @@ async fn write_response(stream: &mut TcpStream, status: u16, origin: Option<&str
     }
     head.push_str("\r\n");
     stream.write_all(head.as_bytes()).await?;
-    if !bytes.is_empty() {
+    if !head_only && !bytes.is_empty() {
         stream.write_all(&bytes).await?;
     }
     let _ = stream.shutdown().await;
+    Ok(())
+}
+
+// ---------------- RFC 7233 Byte-Range Video Streaming ----------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByteRangeOutcome {
+    Full,
+    Partial { start: u64, end: u64 },
+    Unsatisfiable,
+}
+
+/// Parses an HTTP `Range` request header per RFC 7233 against `total_len`.
+pub fn parse_byte_range(range_header: Option<&str>, total_len: u64) -> ByteRangeOutcome {
+    let Some(raw) = range_header.map(str::trim).filter(|s| !s.is_empty()) else {
+        return ByteRangeOutcome::Full;
+    };
+    let Some(spec) = raw
+        .get(..6)
+        .filter(|p| p.eq_ignore_ascii_case("bytes="))
+        .and_then(|_| raw.get(6..))
+    else {
+        // RFC 7233 §3.1: ignore unknown range units and serve full representation.
+        return ByteRangeOutcome::Full;
+    };
+    if total_len == 0 {
+        return ByteRangeOutcome::Unsatisfiable;
+    }
+    let spec = spec.trim();
+    if spec.contains(',') {
+        // Multi-part ranges are not used by HTML5 <video>; serve 200 OK instead of failing.
+        return ByteRangeOutcome::Full;
+    }
+    let Some((start_str, end_str)) = spec.split_once('-') else {
+        return ByteRangeOutcome::Unsatisfiable;
+    };
+    let start_str = start_str.trim();
+    let end_str = end_str.trim();
+
+    if start_str.is_empty() {
+        // Suffix byte-range-spec: `bytes=-<suffix>`
+        let Ok(suffix) = end_str.parse::<u64>() else {
+            return ByteRangeOutcome::Unsatisfiable;
+        };
+        if suffix == 0 {
+            return ByteRangeOutcome::Unsatisfiable;
+        }
+        let start = total_len.saturating_sub(suffix);
+        ByteRangeOutcome::Partial {
+            start,
+            end: total_len - 1,
+        }
+    } else if end_str.is_empty() {
+        // Open-ended byte-range-spec: `bytes=<start>-`
+        let Ok(start) = start_str.parse::<u64>() else {
+            return ByteRangeOutcome::Unsatisfiable;
+        };
+        if start >= total_len {
+            return ByteRangeOutcome::Unsatisfiable;
+        }
+        ByteRangeOutcome::Partial {
+            start,
+            end: total_len - 1,
+        }
+    } else {
+        // Bounded byte-range-spec: `bytes=<start>-<end>`
+        let (Ok(start), Ok(end)) = (start_str.parse::<u64>(), end_str.parse::<u64>()) else {
+            return ByteRangeOutcome::Unsatisfiable;
+        };
+        if start > end || start >= total_len {
+            return ByteRangeOutcome::Unsatisfiable;
+        }
+        ByteRangeOutcome::Partial {
+            start,
+            end: end.min(total_len - 1),
+        }
+    }
+}
+
+fn parse_strict_media_id(id_segment: &str) -> Option<i64> {
+    if id_segment.is_empty() || !id_segment.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    id_segment.parse::<i64>().ok().filter(|&id| id > 0)
+}
+
+fn has_query_flag(query: &str, key: &str) -> bool {
+    query.split('&').any(|pair| {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        k == key && matches!(v, "1" | "true")
+    })
+}
+
+fn video_mime_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("mp4" | "m4v") => "video/mp4",
+        Some("mov") => "video/quicktime",
+        Some("webm") => "video/webm",
+        Some("mkv") => "video/x-matroska",
+        Some("avi") => "video/x-msvideo",
+        Some("3gp") => "video/3gpp",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Resolves a registered `kind='video'` row in SQLite (or its cached H.264 `thumbs/preview_{id}.mp4`)
+/// strictly by integer `media_id` — zero arbitrary filesystem path access.
+pub fn resolve_video_file(
+    c: &Connection,
+    thumbs_dir: &Path,
+    media_id: i64,
+    want_preview: bool,
+) -> Result<Option<PathBuf>> {
+    let row: Option<(String, String, i64)> = c
+        .query_row(
+            "SELECT kind, path, status FROM media WHERE id=?1",
+            [media_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((kind, orig_path, status)) = row else {
+        return Ok(None);
+    };
+    if kind != "video" || status == storage::STATUS_PURGED {
+        return Ok(None);
+    }
+
+    let preview_path = thumbs_dir.join(format!("preview_{media_id}.mp4"));
+    let preview_ready = preview_path
+        .metadata()
+        .map(|m| m.is_file() && m.len() > 0)
+        .unwrap_or(false);
+
+    if want_preview {
+        return Ok(if preview_ready { Some(preview_path) } else { None });
+    }
+    if preview_ready {
+        return Ok(Some(preview_path));
+    }
+
+    let orig = PathBuf::from(orig_path);
+    if orig.is_file() {
+        Ok(Some(orig))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn handle_video_request(
+    app: &AppHandle,
+    stream: &mut TcpStream,
+    head_only: bool,
+    id_segment: &str,
+    query: &str,
+    range_header: Option<&str>,
+    cors_origin: Option<&str>,
+) -> Result<()> {
+    let app_clone = app.clone();
+    serve_video_with_lookup(
+        stream,
+        head_only,
+        id_segment,
+        query,
+        range_header,
+        cors_origin,
+        move |media_id, want_preview| {
+            let st = app_clone.state::<AppState>();
+            let thumbs_dir = st.paths().thumbs;
+            let c = st.db.lock().unwrap();
+            resolve_video_file(&c, &thumbs_dir, media_id, want_preview)
+        },
+    )
+    .await
+}
+
+async fn serve_video_with_lookup<F>(
+    stream: &mut TcpStream,
+    head_only: bool,
+    id_segment: &str,
+    query: &str,
+    range_header: Option<&str>,
+    cors_origin: Option<&str>,
+    lookup: F,
+) -> Result<()>
+where
+    F: FnOnce(i64, bool) -> Result<Option<PathBuf>> + Send + 'static,
+{
+    let Some(media_id) = parse_strict_media_id(id_segment) else {
+        write_json_response(
+            stream,
+            400,
+            cors_origin,
+            &json!({"ok": false, "error": "Invalid video id"}),
+            head_only,
+        )
+        .await?;
+        return Ok(());
+    };
+    let want_preview = has_query_flag(query, "preview");
+    let resolved = tokio::task::spawn_blocking(move || lookup(media_id, want_preview)).await??;
+
+    let Some(video_path) = resolved else {
+        write_json_response(
+            stream,
+            404,
+            cors_origin,
+            &json!({"ok": false, "error": "Video not found"}),
+            head_only,
+        )
+        .await?;
+        return Ok(());
+    };
+
+    stream_video_file(stream, &video_path, head_only, range_header, cors_origin).await
+}
+
+async fn stream_video_file(
+    stream: &mut TcpStream,
+    video_path: &Path,
+    head_only: bool,
+    range_header: Option<&str>,
+    cors_origin: Option<&str>,
+) -> Result<()> {
+    let mut file = match tokio::fs::File::open(video_path).await {
+        Ok(f) => f,
+        Err(_) => {
+            write_json_response(
+                stream,
+                404,
+                cors_origin,
+                &json!({"ok": false, "error": "Video file missing on disk"}),
+                head_only,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let total_len = file.metadata().await?.len();
+    let mime = video_mime_type(video_path);
+
+    let mut cors_headers = String::from(
+        "Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS\r\n\
+         Access-Control-Allow-Headers: Content-Type, Range\r\n\
+         Access-Control-Expose-Headers: Accept-Ranges, Content-Range, Content-Length\r\n\
+         Access-Control-Allow-Private-Network: true\r\n",
+    );
+    if let Some(o) = cors_origin {
+        cors_headers.push_str(&format!("Access-Control-Allow-Origin: {o}\r\nVary: Origin\r\n"));
+    }
+
+    match parse_byte_range(range_header, total_len) {
+        ByteRangeOutcome::Unsatisfiable => {
+            let head = format!(
+                "HTTP/1.1 416 Range Not Satisfiable\r\n\
+                 Accept-Ranges: bytes\r\n\
+                 Content-Range: bytes */{total_len}\r\n\
+                 Content-Length: 0\r\n\
+                 Cache-Control: no-cache\r\n\
+                 Connection: close\r\n\
+                 {cors_headers}\r\n"
+            );
+            stream.write_all(head.as_bytes()).await?;
+            let _ = stream.shutdown().await;
+            Ok(())
+        }
+        ByteRangeOutcome::Full => {
+            let head = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: {mime}\r\n\
+                 Accept-Ranges: bytes\r\n\
+                 Content-Length: {total_len}\r\n\
+                 Cache-Control: no-cache\r\n\
+                 Connection: close\r\n\
+                 {cors_headers}\r\n"
+            );
+            stream.write_all(head.as_bytes()).await?;
+            if !head_only && total_len > 0 {
+                stream_file_range(&mut file, stream, 0, total_len).await?;
+            }
+            let _ = stream.shutdown().await;
+            Ok(())
+        }
+        ByteRangeOutcome::Partial { start, end } => {
+            let send_len = end - start + 1;
+            let head = format!(
+                "HTTP/1.1 206 Partial Content\r\n\
+                 Content-Type: {mime}\r\n\
+                 Accept-Ranges: bytes\r\n\
+                 Content-Range: bytes {start}-{end}/{total_len}\r\n\
+                 Content-Length: {send_len}\r\n\
+                 Cache-Control: no-cache\r\n\
+                 Connection: close\r\n\
+                 {cors_headers}\r\n"
+            );
+            stream.write_all(head.as_bytes()).await?;
+            if !head_only && send_len > 0 {
+                stream_file_range(&mut file, stream, start, send_len).await?;
+            }
+            let _ = stream.shutdown().await;
+            Ok(())
+        }
+    }
+}
+
+async fn stream_file_range(
+    file: &mut tokio::fs::File,
+    stream: &mut TcpStream,
+    start: u64,
+    mut remaining: u64,
+) -> Result<()> {
+    if start > 0 {
+        file.seek(SeekFrom::Start(start)).await?;
+    }
+    let mut chunk = vec![0u8; VIDEO_STREAM_CHUNK];
+    while remaining > 0 {
+        let to_read = (remaining as usize).min(chunk.len());
+        let n = file.read(&mut chunk[..to_read]).await?;
+        if n == 0 {
+            break;
+        }
+        stream.write_all(&chunk[..n]).await?;
+        remaining -= n as u64;
+    }
     Ok(())
 }
 
@@ -1465,8 +1834,267 @@ mod tests {
     fn cors_origin_allowlist() {
         assert_eq!(allowed_origin(Some("chrome-extension://abcdefghijklmnop")), Some("chrome-extension://abcdefghijklmnop"));
         assert_eq!(allowed_origin(Some("https://qxc.hi.cn")), Some("https://qxc.hi.cn"));
+        assert_eq!(allowed_origin(Some("http://tauri.localhost")), Some("http://tauri.localhost"));
+        assert_eq!(allowed_origin(Some("https://tauri.localhost")), Some("https://tauri.localhost"));
+        assert_eq!(allowed_origin(Some("tauri://localhost")), Some("tauri://localhost"));
+        assert_eq!(allowed_origin(Some("http://localhost:5173")), Some("http://localhost:5173"));
         assert_eq!(allowed_origin(Some("https://evil.com")), None);
         assert_eq!(allowed_origin(None), None);
+    }
+
+    #[test]
+    fn byte_range_rfc7233_parsing() {
+        let total = 10_000u64;
+        assert_eq!(parse_byte_range(None, total), ByteRangeOutcome::Full);
+        assert_eq!(parse_byte_range(Some(""), total), ByteRangeOutcome::Full);
+        assert_eq!(
+            parse_byte_range(Some("bytes=0-1023"), total),
+            ByteRangeOutcome::Partial { start: 0, end: 1023 }
+        );
+        assert_eq!(
+            parse_byte_range(Some("bytes=500-"), total),
+            ByteRangeOutcome::Partial { start: 500, end: 9999 }
+        );
+        assert_eq!(
+            parse_byte_range(Some("bytes=-256"), total),
+            ByteRangeOutcome::Partial { start: 9744, end: 9999 }
+        );
+        // Suffix larger than file clamps to full file [0, total - 1]
+        assert_eq!(
+            parse_byte_range(Some("bytes=-99999"), total),
+            ByteRangeOutcome::Partial { start: 0, end: 9999 }
+        );
+        // End past EOF clamps to total - 1 when start < total
+        assert_eq!(
+            parse_byte_range(Some("bytes=9000-50000"), total),
+            ByteRangeOutcome::Partial { start: 9000, end: 9999 }
+        );
+        // Single-byte range at final byte
+        assert_eq!(
+            parse_byte_range(Some("bytes=9999-9999"), total),
+            ByteRangeOutcome::Partial { start: 9999, end: 9999 }
+        );
+        // Out-of-range / inverted / malformed -> 416 Unsatisfiable
+        assert_eq!(parse_byte_range(Some("bytes=10000-"), total), ByteRangeOutcome::Unsatisfiable);
+        assert_eq!(parse_byte_range(Some("bytes=10000-10500"), total), ByteRangeOutcome::Unsatisfiable);
+        assert_eq!(parse_byte_range(Some("bytes=500-200"), total), ByteRangeOutcome::Unsatisfiable);
+        assert_eq!(parse_byte_range(Some("bytes=-0"), total), ByteRangeOutcome::Unsatisfiable);
+        assert_eq!(parse_byte_range(Some("bytes=abc-def"), total), ByteRangeOutcome::Unsatisfiable);
+        assert_eq!(parse_byte_range(Some("bytes=0-0"), 0), ByteRangeOutcome::Unsatisfiable);
+
+        // Strict integer media_id validation rejects traversal & non-digits
+        assert_eq!(parse_strict_media_id("42"), Some(42));
+        assert_eq!(parse_strict_media_id("0"), None);
+        assert_eq!(parse_strict_media_id("-1"), None);
+        assert_eq!(parse_strict_media_id("../1"), None);
+        assert_eq!(parse_strict_media_id("1/../../etc"), None);
+        assert_eq!(parse_strict_media_id("12abc"), None);
+    }
+
+    #[tokio::test]
+    async fn video_streaming_endpoint_end_to_end() {
+        use std::sync::{Arc, Mutex};
+
+        let tmp_root = std::env::temp_dir().join(format!("kid_finder_vid_stream_{}", uuid::Uuid::new_v4()));
+        let thumbs_dir = tmp_root.join("thumbs");
+        let ext_wx_dir = tmp_root.join("xwechat_files").join("msg").join("video");
+        std::fs::create_dir_all(&thumbs_dir).unwrap();
+        std::fs::create_dir_all(&ext_wx_dir).unwrap();
+
+        // 150 KB deterministic payload (> 2 * 64KB chunk size to exercise chunked streaming)
+        let orig_bytes: Vec<u8> = (0..153_600usize).map(|i| ((i * 31 + 7) % 251) as u8).collect();
+        let orig_vid_path = ext_wx_dir.join("sample_hevc.mp4");
+        std::fs::write(&orig_vid_path, &orig_bytes).unwrap();
+
+        let img_path = tmp_root.join("photo.jpg");
+        std::fs::write(&img_path, b"not-a-video").unwrap();
+
+        let conn = db::open(&tmp_root.join("kid-finder.db")).unwrap();
+        conn.execute(
+            "INSERT INTO media(sha256,kind,path,orig_name,source,imported_at,status) VALUES('sha_v','video',?1,'sample.mp4','wechat-local','2026-11-21 10:00:00',1)",
+            params![orig_vid_path.to_string_lossy()],
+        )
+        .unwrap();
+        let vid_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO media(sha256,kind,path,orig_name,source,imported_at,status) VALUES('sha_i','image',?1,'photo.jpg','local','2026-11-21 10:00:00',1)",
+            params![img_path.to_string_lossy()],
+        )
+        .unwrap();
+        let img_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO media(sha256,kind,path,orig_name,source,imported_at,status) VALUES('sha_p','video',?1,'purged.mp4','local','2026-11-21 10:00:00',?2)",
+            params![orig_vid_path.to_string_lossy(), storage::STATUS_PURGED],
+        )
+        .unwrap();
+        let purged_id = conn.last_insert_rowid();
+
+        let db_arc = Arc::new(Mutex::new(conn));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let thumbs_srv = thumbs_dir.clone();
+        let db_srv = db_arc.clone();
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { break };
+                let db_c = db_srv.clone();
+                let thumbs_c = thumbs_srv.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::with_capacity(2048);
+                    let mut tmp = [0u8; 2048];
+                    let header_end = loop {
+                        let Ok(n) = stream.read(&mut tmp).await else { return };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(pos) = find_header_end(&buf) {
+                            break pos;
+                        }
+                    };
+                    let head = std::str::from_utf8(&buf[..header_end]).unwrap();
+                    let mut lines = head.split("\r\n");
+                    let first = lines.next().unwrap_or("");
+                    let mut parts = first.split_whitespace();
+                    let method = parts.next().unwrap_or("");
+                    let raw_path = parts.next().unwrap_or("/");
+                    let (path, query) = raw_path.split_once('?').unwrap_or((raw_path, ""));
+                    let mut origin = None;
+                    let mut range_hdr = None;
+                    for line in lines {
+                        if let Some((k, v)) = line.split_once(':') {
+                            let kl = k.trim().to_ascii_lowercase();
+                            if kl == "origin" {
+                                origin = Some(v.trim().to_string());
+                            } else if kl == "range" {
+                                range_hdr = Some(v.trim().to_string());
+                            }
+                        }
+                    }
+                    let cors = allowed_origin(origin.as_deref());
+                    let id_seg = path.strip_prefix("/api/video/").unwrap_or("");
+                    let _ = serve_video_with_lookup(
+                        &mut stream,
+                        method == "HEAD",
+                        id_seg,
+                        query,
+                        range_hdr.as_deref(),
+                        cors,
+                        move |mid, want_prev| {
+                            let c = db_c.lock().unwrap();
+                            resolve_video_file(&c, &thumbs_c, mid, want_prev)
+                        },
+                    )
+                    .await;
+                });
+            }
+        });
+
+        let send_raw = |req: String| async move {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client.write_all(req.as_bytes()).await.unwrap();
+            let mut resp = Vec::new();
+            client.read_to_end(&mut resp).await.unwrap();
+            let sep = find_header_end(&resp).expect("HTTP header separator");
+            let head_str = String::from_utf8_lossy(&resp[..sep]).to_string();
+            let body = resp[sep + 4..].to_vec();
+            (head_str, body)
+        };
+
+        // 1) Full GET without Range -> 200 OK + Accept-Ranges: bytes + full 150KB body
+        let (h200, b200) = send_raw(format!(
+            "GET /api/video/{vid_id} HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://tauri.localhost\r\n\r\n"
+        ))
+        .await;
+        assert!(h200.starts_with("HTTP/1.1 200 OK\r\n"), "{h200}");
+        assert!(h200.contains("Content-Type: video/mp4\r\n"));
+        assert!(h200.contains("Accept-Ranges: bytes\r\n"));
+        assert!(h200.contains("Content-Length: 153600\r\n"));
+        assert!(h200.contains("Access-Control-Allow-Origin: http://tauri.localhost\r\n"));
+        assert_eq!(b200, orig_bytes);
+
+        // 2) Bounded Range `bytes=0-1023` -> 206 Partial Content
+        let (h206_a, b206_a) = send_raw(format!(
+            "GET /api/video/{vid_id} HTTP/1.1\r\nHost: 127.0.0.1\r\nRange: bytes=0-1023\r\n\r\n"
+        ))
+        .await;
+        assert!(h206_a.starts_with("HTTP/1.1 206 Partial Content\r\n"), "{h206_a}");
+        assert!(h206_a.contains("Content-Range: bytes 0-1023/153600\r\n"));
+        assert!(h206_a.contains("Content-Length: 1024\r\n"));
+        assert_eq!(b206_a, orig_bytes[0..1024]);
+
+        // 3) Open-ended Range `bytes=500-` -> 206 Partial Content across multiple 64KB chunks
+        let (h206_b, b206_b) = send_raw(format!(
+            "GET /api/video/{vid_id} HTTP/1.1\r\nHost: 127.0.0.1\r\nRange: bytes=500-\r\n\r\n"
+        ))
+        .await;
+        assert!(h206_b.starts_with("HTTP/1.1 206 Partial Content\r\n"));
+        assert!(h206_b.contains("Content-Range: bytes 500-153599/153600\r\n"));
+        assert!(h206_b.contains("Content-Length: 153100\r\n"));
+        assert_eq!(b206_b, orig_bytes[500..]);
+
+        // 4) Suffix Range `bytes=-256` -> 206 Partial Content tail bytes
+        let (h206_c, b206_c) = send_raw(format!(
+            "GET /api/video/{vid_id} HTTP/1.1\r\nHost: 127.0.0.1\r\nRange: bytes=-256\r\n\r\n"
+        ))
+        .await;
+        assert!(h206_c.starts_with("HTTP/1.1 206 Partial Content\r\n"));
+        assert!(h206_c.contains("Content-Range: bytes 153344-153599/153600\r\n"));
+        assert!(h206_c.contains("Content-Length: 256\r\n"));
+        assert_eq!(b206_c, orig_bytes[153_344..]);
+
+        // 5) Out-of-range `bytes=200000-200500` -> 416 Range Not Satisfiable
+        let (h416, b416) = send_raw(format!(
+            "GET /api/video/{vid_id} HTTP/1.1\r\nHost: 127.0.0.1\r\nRange: bytes=200000-200500\r\n\r\n"
+        ))
+        .await;
+        assert!(h416.starts_with("HTTP/1.1 416 Range Not Satisfiable\r\n"), "{h416}");
+        assert!(h416.contains("Content-Range: bytes */153600\r\n"));
+        assert!(b416.is_empty());
+
+        // 6) HEAD request -> headers match 206, 0 body bytes
+        let (h_head, b_head) = send_raw(format!(
+            "HEAD /api/video/{vid_id} HTTP/1.1\r\nHost: 127.0.0.1\r\nRange: bytes=0-1023\r\n\r\n"
+        ))
+        .await;
+        assert!(h_head.starts_with("HTTP/1.1 206 Partial Content\r\n"));
+        assert!(h_head.contains("Content-Length: 1024\r\n"));
+        assert!(b_head.is_empty());
+
+        // 7) Preview proxy resolution: 404 before proxy exists, 200/206 once `thumbs/preview_<id>.mp4` exists
+        let (h_no_prev, _) = send_raw(format!(
+            "GET /api/video/{vid_id}?preview=1 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        ))
+        .await;
+        assert!(h_no_prev.starts_with("HTTP/1.1 404 Not Found\r\n"));
+
+        let preview_bytes: Vec<u8> = (0..4096usize).map(|i| (i % 255) as u8).collect();
+        std::fs::write(thumbs_dir.join(format!("preview_{vid_id}.mp4")), &preview_bytes).unwrap();
+
+        let (h_prev, b_prev) = send_raw(format!(
+            "GET /api/video/{vid_id}?preview=1&t=123 HTTP/1.1\r\nHost: 127.0.0.1\r\nRange: bytes=100-299\r\n\r\n"
+        ))
+        .await;
+        assert!(h_prev.starts_with("HTTP/1.1 206 Partial Content\r\n"));
+        assert!(h_prev.contains("Content-Range: bytes 100-299/4096\r\n"));
+        assert_eq!(b_prev, preview_bytes[100..300]);
+
+        // 8) Security boundaries: image row -> 404, purged row -> 404, path traversal -> 400
+        let (h_img, _) = send_raw(format!("GET /api/video/{img_id} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")).await;
+        assert!(h_img.starts_with("HTTP/1.1 404 Not Found\r\n"));
+
+        let (h_purged, _) = send_raw(format!("GET /api/video/{purged_id} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")).await;
+        assert!(h_purged.starts_with("HTTP/1.1 404 Not Found\r\n"));
+
+        let (h_trav, _) = send_raw("GET /api/video/../1 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".to_string()).await;
+        assert!(h_trav.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+
+        srv.abort();
+        drop(db_arc);
+        let _ = std::fs::remove_dir_all(&tmp_root);
     }
 
     #[test]

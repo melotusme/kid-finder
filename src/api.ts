@@ -148,6 +148,7 @@ export const api = {
     invoke<Hit | null>("reject_hit", { personId, faceId, ocrId, threshold }),
   exportItems: (outDir: string, items: { mediaId: number; segments: [number, number][] }[], fade: number) =>
     invoke<ExportReport>("export", { outDir, items, fade }),
+  prepareVideoPreview: (mediaId: number) => invoke<string>("prepare_video_preview", { mediaId }),
   storageStats: () => invoke<StorageStats>("get_storage_stats"),
   migrateStorage: (newRoot: string) => invoke<MigrateReport>("migrate_storage", { newRoot }),
   purgeUnmatched: () => invoke<PurgeReport>("purge_unmatched"),
@@ -162,6 +163,19 @@ export const api = {
 };
 
 export const src = (p: string | null | undefined) => (p ? convertFileSrc(p) : "");
+
+export const videoStreamUrl = (
+  bridgePort: number,
+  mediaId: number,
+  preview = false,
+  cacheBust?: number,
+): string => {
+  const params = new URLSearchParams();
+  if (preview) params.set("preview", "1");
+  if (cacheBust !== undefined) params.set("t", String(cacheBust));
+  const qs = params.toString();
+  return `http://127.0.0.1:${bridgePort}/api/video/${mediaId}${qs ? `?${qs}` : ""}`;
+};
 
 export const fmtTime = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
 
