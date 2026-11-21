@@ -1,5 +1,5 @@
-//! Downloading face models / ffmpeg, and locating ffmpeg.
-use crate::{face, AppState, Paths};
+//! Downloading face / OCR models and ffmpeg, and locating ffmpeg.
+use crate::{face, ocr, AppState, Paths};
 use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
 use serde::Serialize;
@@ -57,6 +57,29 @@ pub fn models_ready(paths: &Paths) -> bool {
     })
 }
 
+pub fn ocr_models_ready(paths: &Paths) -> bool {
+    [ocr::OCR_DET_MODEL, ocr::OCR_REC_MODEL].iter().all(|f| {
+        std::fs::metadata(paths.models.join(f)).map(|m| m.len() > 1_000_000).unwrap_or(false)
+    })
+}
+
+pub async fn download_ocr_models(app: &AppHandle, paths: &Paths) -> Result<()> {
+    if ocr_models_ready(paths) {
+        return Ok(());
+    }
+    for (f, url) in [
+        (ocr::OCR_DET_MODEL, ocr::OCR_DET_URL),
+        (ocr::OCR_REC_MODEL, ocr::OCR_REC_URL),
+    ] {
+        let dest = paths.models.join(f);
+        if std::fs::metadata(&dest).map(|m| m.len() > 1_000_000).unwrap_or(false) {
+            continue;
+        }
+        download(app, url, &dest, f).await?;
+    }
+    Ok(())
+}
+
 pub async fn download_models(app: &AppHandle, paths: &Paths) -> Result<()> {
     for f in [face::DET_MODEL, face::REC_MODEL] {
         let dest = paths.models.join(f);
@@ -65,6 +88,7 @@ pub async fn download_models(app: &AppHandle, paths: &Paths) -> Result<()> {
         }
         download(app, &format!("{MODEL_BASE}/{f}"), &dest, f).await?;
     }
+    download_ocr_models(app, paths).await?;
     Ok(())
 }
 
@@ -117,4 +141,31 @@ pub async fn install_ffmpeg(app: &AppHandle, paths: &Paths) -> Result<PathBuf> {
 #[cfg(not(windows))]
 pub async fn install_ffmpeg(_app: &AppHandle, _paths: &Paths) -> Result<PathBuf> {
     bail!("macOS 请在终端执行：brew install ffmpeg，然后重启本应用")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ocr_models_ready_size_check() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("kf_dl_test_{}", uuid::Uuid::new_v4()));
+        let paths = Paths::new(dir.clone())?;
+        assert!(!ocr_models_ready(&paths));
+
+        // Truncated/small files (< 1_000_000 bytes) must not count as ready
+        std::fs::write(paths.models.join(ocr::OCR_DET_MODEL), vec![0u8; 4096])?;
+        std::fs::write(paths.models.join(ocr::OCR_REC_MODEL), vec![0u8; 4096])?;
+        assert!(!ocr_models_ready(&paths));
+
+        // Both > 1_000_000 bytes -> ready
+        let f_det = std::fs::File::create(paths.models.join(ocr::OCR_DET_MODEL))?;
+        f_det.set_len(1_500_000)?;
+        let f_rec = std::fs::File::create(paths.models.join(ocr::OCR_REC_MODEL))?;
+        f_rec.set_len(1_500_000)?;
+        assert!(ocr_models_ready(&paths));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
 }

@@ -4,6 +4,7 @@ mod download;
 mod extension;
 mod face;
 mod media;
+pub mod ocr;
 mod qxc;
 
 use anyhow::{anyhow, Result};
