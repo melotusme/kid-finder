@@ -16,6 +16,7 @@ export type Status = {
   bridgePort: number;
   extensionDir: string;
   webScanned: number;
+  refsSignature: string;
 };
 export type ExtensionInstallResult = {
   dir: string;

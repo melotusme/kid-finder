@@ -26,7 +26,7 @@ pub struct Paths {
 }
 
 impl Paths {
-    fn new(data: PathBuf) -> Result<Self> {
+    pub fn new(data: PathBuf) -> Result<Self> {
         let p = Self {
             models: data.join("models"),
             library: data.join("library"),
@@ -81,6 +81,7 @@ struct Status {
     bridge_port: u16,
     extension_dir: String,
     web_scanned: i64,
+    refs_signature: String,
 }
 
 #[tauri::command]
@@ -107,6 +108,7 @@ async fn get_status(app: AppHandle) -> CmdResult<Status> {
             bridge_port: bridge::BRIDGE_PORT,
             extension_dir: extension::extension_dir(&st.paths).to_string_lossy().to_string(),
             web_scanned: n("SELECT COUNT(*) FROM web_scans")?,
+            refs_signature: bridge::compute_refs_signature(&c)?,
         })
     })
     .await
@@ -193,6 +195,13 @@ async fn delete_person(app: AppHandle, id: i64) -> CmdResult<()> {
     blocking(move || {
         let st = app.state::<AppState>();
         let c = st.db.lock().unwrap();
+        if let Ok(mut s) = c.prepare("SELECT thumb FROM refs WHERE person_id=?1") {
+            if let Ok(rows) = s.query_map([id], |r| r.get::<_, Option<String>>(0)) {
+                for t in rows.flatten().flatten() {
+                    let _ = std::fs::remove_file(t);
+                }
+            }
+        }
         c.execute("DELETE FROM rejections WHERE person_id=?1", [id])?;
         c.execute("DELETE FROM persons WHERE id=?1", [id])?;
         Ok(())

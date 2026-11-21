@@ -34,9 +34,21 @@ a { color: #e08a00; cursor: pointer; }
 .tile.sel { border-color: #f59e0b; }
 .imgwrap { position: relative; aspect-ratio: 1; background: #eee; cursor: zoom-in; overflow: hidden; }
 .imgwrap img { width: 100%; height: 100%; object-fit: cover; }
-.box { position: absolute; border: 2px solid #f59e0b; border-radius: 4px; display: none; }
+.box { position: absolute; border: 2px solid rgba(245, 158, 11, .7); border-radius: 4px; box-shadow: 0 0 0 1px rgba(0,0,0,.22); pointer-events: none; transition: border-color .15s, box-shadow .15s; }
+.tile:hover .box { border-color: #f59e0b; box-shadow: 0 0 0 2px rgba(245, 158, 11, .35); }
 .badge { position: absolute; left: 6px; bottom: 6px; background: #000a; color: #fff; padding: 1px 8px; border-radius: 10px; font-size: 12px; }
+.dur-badge { position: absolute; right: 6px; bottom: 6px; background: #000a; color: #fff; padding: 1px 7px; border-radius: 8px; font-size: 12px; font-variant-numeric: tabular-nums; }
 .tilebar { padding: 4px 8px; gap: 4px; }
+.video-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 14px; }
+.video-card { display: flex; flex-direction: column; }
+.vidwrap { position: relative; aspect-ratio: 16 / 9; background: #1f2937; cursor: pointer; overflow: hidden; display: grid; place-items: center; }
+.vidwrap img { width: 100%; height: 100%; object-fit: cover; }
+.vidwrap .noposter { color: #9ca3af; font-size: 13px; }
+.seg-chips { display: flex; flex-wrap: wrap; gap: 5px; padding: 6px 8px 2px; }
+.seg-chip { background: #fff7ed; color: #c2410c; border: 1px solid #fed7aa; border-radius: 999px; padding: 1px 8px; font-size: 12px; font-variant-numeric: tabular-nums; cursor: pointer; }
+.seg-chip:hover { background: #ffedd5; filter: none; }
+.ffmpeg-banner { background: #fffbeb; border: 1px solid #fde68a; color: #92400e; padding: 10px 14px; border-radius: 8px; margin-bottom: 12px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.empty-card { text-align: center; padding: 28px 18px; }
 .progress { display: flex; gap: 10px; align-items: center; background: #fff; padding: 8px 12px; border-radius: 8px; margin-bottom: 10px; font-size: 13px; }
 .progress progress { flex: 0 0 240px; }
 .progress span:last-child { color: #888; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

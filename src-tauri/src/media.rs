@@ -84,7 +84,8 @@ pub fn store_file(st: &AppState, m: NewMedia) -> Result<i64> {
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_else(|| if m.kind == "video" { "mp4".into() } else { "jpg".into() });
-    let dir = st.paths.library.join(&m.sha[..2]);
+    let category = if m.kind == "video" { "videos" } else { "photos" };
+    let dir = st.paths.library.join(category).join(&m.sha[..2]);
     std::fs::create_dir_all(&dir)?;
     let dest = dir.join(format!("{}.{ext}", m.sha));
     if m.move_file {
@@ -509,4 +510,113 @@ pub fn export(app: &AppHandle, out_dir: &Path, items: Vec<ExportItem>, fade: f64
     }
     let _ = app.emit("progress", Progress { stage: "export", done: total, total, current: String::new() });
     Ok(rep)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Paths;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Mutex;
+
+    #[test]
+    fn store_file_separates_photos_and_videos_and_keeps_legacy_paths() {
+        let root = std::env::temp_dir().join(format!("kid_finder_media_test_{}", uuid::Uuid::new_v4()));
+        let paths = Paths::new(root.clone()).unwrap();
+        let conn = db::open(&paths.data.join("kid-finder.db")).unwrap();
+        let st = AppState {
+            paths,
+            db: Mutex::new(conn),
+            engine: Mutex::new(None),
+            processing: AtomicBool::new(false),
+            bridge_running: AtomicBool::new(false),
+            web_cache: Mutex::new(HashMap::new()),
+        };
+
+        let src_img = st.paths.tmp.join("sample.jpg");
+        let src_vid = st.paths.tmp.join("sample.mp4");
+        std::fs::write(&src_img, b"fake-jpeg-bytes").unwrap();
+        std::fs::write(&src_vid, b"fake-mp4-bytes").unwrap();
+        let sha_img = sha256_file(&src_img).unwrap();
+        let sha_vid = sha256_file(&src_vid).unwrap();
+
+        let img_id = store_file(
+            &st,
+            NewMedia {
+                src: &src_img,
+                sha: &sha_img,
+                kind: "image",
+                orig_name: "sample.jpg",
+                source: "local",
+                remote_id: None,
+                remote_time: None,
+                move_file: false,
+            },
+        )
+        .unwrap();
+
+        let vid_id = store_file(
+            &st,
+            NewMedia {
+                src: &src_vid,
+                sha: &sha_vid,
+                kind: "video",
+                orig_name: "sample.mp4",
+                source: "local",
+                remote_id: None,
+                remote_time: None,
+                move_file: false,
+            },
+        )
+        .unwrap();
+
+        let expected_img = st.paths.library.join("photos").join(&sha_img[..2]).join(format!("{sha_img}.jpg"));
+        let expected_vid = st.paths.library.join("videos").join(&sha_vid[..2]).join(format!("{sha_vid}.mp4"));
+        assert!(expected_img.is_file());
+        assert!(expected_vid.is_file());
+
+        let c = st.db.lock().unwrap();
+        let db_img_path: String = c.query_row("SELECT path FROM media WHERE id=?1", [img_id], |r| r.get(0)).unwrap();
+        let db_vid_path: String = c.query_row("SELECT path FROM media WHERE id=?1", [vid_id], |r| r.get(0)).unwrap();
+        assert_eq!(PathBuf::from(&db_img_path), expected_img);
+        assert_eq!(PathBuf::from(&db_vid_path), expected_vid);
+
+        // Verify backward compatibility with pre-existing legacy rows under library/<sha2>/...
+        let legacy_dir = st.paths.library.join("ab");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy_file = legacy_dir.join("abcdef123456.jpg");
+        std::fs::write(&legacy_file, b"legacy-img").unwrap();
+        c.execute(
+            "INSERT INTO media(sha256,kind,path,orig_name,source,imported_at,status) VALUES('abcdef123456','image',?1,'old.jpg','local','2026-01-01 00:00:00',1)",
+            params![legacy_file.to_string_lossy()],
+        )
+        .unwrap();
+        let legacy_mid = c.last_insert_rowid();
+        c.execute("INSERT INTO persons(name, created_at) VALUES('宝宝', '2026-01-01 00:00:00')", []).unwrap();
+        let pid = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO refs(person_id, embedding, thumb, source, created_at) VALUES(?1,?2,NULL,'test','2026-01-01 00:00:00')",
+            params![pid, db::emb_to_blob(&[1.0f32, 0.0f32])],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO faces(media_id,t,x1,y1,x2,y2,score,embedding) VALUES(?1,NULL,0.1,0.1,0.5,0.5,0.9,?2)",
+            params![legacy_mid, db::emb_to_blob(&[1.0f32, 0.0f32])],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO faces(media_id,t,x1,y1,x2,y2,score,embedding) VALUES(?1,NULL,0.2,0.2,0.6,0.6,0.9,?2)",
+            params![img_id, db::emb_to_blob(&[1.0f32, 0.0f32])],
+        )
+        .unwrap();
+
+        let hits = search(&c, pid, 0.5).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().any(|h| PathBuf::from(&h.path) == legacy_file));
+        assert!(hits.iter().any(|h| PathBuf::from(&h.path) == expected_img));
+
+        drop(c);
+        drop(st);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

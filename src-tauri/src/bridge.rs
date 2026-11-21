@@ -9,6 +9,7 @@ use futures_util::stream::{self, StreamExt};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -353,6 +354,52 @@ fn safe_folder_name(name: &str) -> String {
 
 // ---------------- endpoints ----------------
 
+/// Deterministic SHA-256 hex digest over ordered rows of `persons`, `refs`, and `rejections`.
+/// Changes whenever any baby is added/renamed/deleted, any reference photo is added/deleted/confirmed,
+/// or any face rejection is added/removed.
+pub fn compute_refs_signature(c: &Connection) -> Result<String> {
+    let mut h = Sha256::new();
+
+    let mut p_stmt = c.prepare("SELECT id, name FROM persons ORDER BY id")?;
+    let mut p_rows = p_stmt.query([])?;
+    while let Some(r) = p_rows.next()? {
+        let id: i64 = r.get(0)?;
+        let name: String = r.get(1)?;
+        h.update(b"P:");
+        h.update(id.to_le_bytes());
+        h.update((name.len() as u64).to_le_bytes());
+        h.update(name.as_bytes());
+        h.update(b"\n");
+    }
+
+    let mut r_stmt = c.prepare("SELECT id, person_id, embedding FROM refs ORDER BY id")?;
+    let mut r_rows = r_stmt.query([])?;
+    while let Some(r) = r_rows.next()? {
+        let id: i64 = r.get(0)?;
+        let person_id: i64 = r.get(1)?;
+        let emb: Vec<u8> = r.get(2)?;
+        h.update(b"R:");
+        h.update(id.to_le_bytes());
+        h.update(person_id.to_le_bytes());
+        h.update((emb.len() as u64).to_le_bytes());
+        h.update(&emb);
+        h.update(b"\n");
+    }
+
+    let mut x_stmt = c.prepare("SELECT person_id, face_id FROM rejections ORDER BY person_id, face_id")?;
+    let mut x_rows = x_stmt.query([])?;
+    while let Some(r) = x_rows.next()? {
+        let person_id: i64 = r.get(0)?;
+        let face_id: i64 = r.get(1)?;
+        h.update(b"X:");
+        h.update(person_id.to_le_bytes());
+        h.update(face_id.to_le_bytes());
+        h.update(b"\n");
+    }
+
+    Ok(hex::encode(h.finalize()))
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BridgePerson {
@@ -374,6 +421,7 @@ async fn api_status(app: &AppHandle) -> Result<Value> {
         let scanned_count: i64 = c.query_row("SELECT COUNT(*) FROM web_scans", [], |r| r.get(0))?;
         let video_scanned_count: i64 =
             c.query_row("SELECT COUNT(*) FROM media WHERE kind='video' AND status=1", [], |r| r.get(0))?;
+        let refs_signature = compute_refs_signature(&c)?;
         let mut ps: Vec<(i64, String)> = c
             .prepare("SELECT id, name FROM persons ORDER BY id")?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -401,6 +449,7 @@ async fn api_status(app: &AppHandle) -> Result<Value> {
             "scannedCount": scanned_count,
             "videoScannedCount": video_scanned_count,
             "defaultExportDir": export_root,
+            "refsSignature": refs_signature,
             "persons": persons,
         }))
     })
@@ -1225,5 +1274,116 @@ mod tests {
     fn pad_segments_merges_overlaps_and_clamps() {
         let merged = media::pad_segments(&[[1.0, 3.0], [5.0, 8.0], [20.0, 22.0]], 2.0, 2.0, Some(22.0));
         assert_eq!(merged, vec![[0.0, 10.0], [18.0, 23.0]]);
+    }
+
+    #[test]
+    fn refs_signature_and_rescoring_track_ref_and_rejection_changes() {
+        let tmp = std::env::temp_dir().join(format!("kid_finder_sig_test_{}.db", uuid::Uuid::new_v4()));
+        let conn = db::open(&tmp).unwrap();
+
+        let sig_empty = compute_refs_signature(&conn).unwrap();
+        assert_eq!(sig_empty.len(), 64);
+        assert_eq!(sig_empty, compute_refs_signature(&conn).unwrap());
+
+        // 1. Add person -> signature changes
+        conn.execute("INSERT INTO persons(name, created_at) VALUES('朵朵', '2026-01-01 00:00:00')", [])
+            .unwrap();
+        let pid = conn.last_insert_rowid();
+        let sig_person = compute_refs_signature(&conn).unwrap();
+        assert_ne!(sig_person, sig_empty);
+
+        // Rename person -> signature changes
+        conn.execute("UPDATE persons SET name='小朵朵' WHERE id=?1", [pid]).unwrap();
+        let sig_renamed = compute_refs_signature(&conn).unwrap();
+        assert_ne!(sig_renamed, sig_person);
+
+        // Prepare cached photo faces and an analyzed video with two frames
+        let photo_faces: CachedFaces = vec![([0.1, 0.1, 0.4, 0.4], vec![0.6f32, 0.8f32])];
+        conn.execute(
+            "INSERT INTO media(sha256,kind,path,orig_name,source,remote_id,imported_at,status,duration) VALUES('sha_v1','video','/tmp/v1.mp4','v1.mp4','qxc-ext','vid-1','2026-01-01 00:00:00',1,20.0)",
+            [],
+        )
+        .unwrap();
+        let mid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO faces(media_id,t,x1,y1,x2,y2,score,embedding) VALUES(?1,2.0,0.0,0.0,0.2,0.2,0.9,?2)",
+            params![mid, db::emb_to_blob(&[1.0f32, 0.0f32])],
+        )
+        .unwrap();
+        let fid_frame1 = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO faces(media_id,t,x1,y1,x2,y2,score,embedding) VALUES(?1,12.0,0.1,0.1,0.3,0.3,0.9,?2)",
+            params![mid, db::emb_to_blob(&[0.6f32, 0.8f32])],
+        )
+        .unwrap();
+        let fid_frame2 = conn.last_insert_rowid();
+
+        // 2. Add first ref [1.0, 0.0] -> photo sim is 0.6, video hits frame 1 (1.0) & frame 2 (0.6) at thresh 0.75 -> only frame 1
+        conn.execute(
+            "INSERT INTO refs(person_id, embedding, thumb, source, created_at) VALUES(?1,?2,NULL,'test','2026-01-01 00:00:01')",
+            params![pid, db::emb_to_blob(&[1.0f32, 0.0f32])],
+        )
+        .unwrap();
+        let ref1_id = conn.last_insert_rowid();
+        let sig_ref1 = compute_refs_signature(&conn).unwrap();
+        assert_ne!(sig_ref1, sig_renamed);
+
+        let refs_v1 = media::person_refs(&conn, pid).unwrap();
+        let (photo_sim1, _) = score_faces(&photo_faces, &refs_v1);
+        assert!((photo_sim1 - 0.6).abs() < 1e-5);
+        let vs1 = score_analyzed_video(&conn, mid, Some(pid), &refs_v1, 0.75).unwrap();
+        assert!((vs1.max_score - 1.0).abs() < 1e-5);
+        assert_eq!(vs1.segments, vec![[2.0, 3.0]]);
+
+        // 3. Add second ref [0.6, 0.8] -> signature changes, photo sim jumps to 1.0, video now matches both frames!
+        conn.execute(
+            "INSERT INTO refs(person_id, embedding, thumb, source, created_at) VALUES(?1,?2,NULL,'test','2026-01-01 00:00:02')",
+            params![pid, db::emb_to_blob(&[0.6f32, 0.8f32])],
+        )
+        .unwrap();
+        let ref2_id = conn.last_insert_rowid();
+        let sig_ref2 = compute_refs_signature(&conn).unwrap();
+        assert_ne!(sig_ref2, sig_ref1);
+
+        let refs_v2 = media::person_refs(&conn, pid).unwrap();
+        let (photo_sim2, _) = score_faces(&photo_faces, &refs_v2);
+        assert!((photo_sim2 - 1.0).abs() < 1e-5);
+        let vs2 = score_analyzed_video(&conn, mid, Some(pid), &refs_v2, 0.75).unwrap();
+        assert_eq!(vs2.segments, vec![[2.0, 3.0], [12.0, 13.0]]);
+
+        // 4. Reject frame 2 -> signature changes, video segments recompute without frame 2
+        conn.execute("INSERT INTO rejections(face_id, person_id) VALUES(?1, ?2)", params![fid_frame2, pid])
+            .unwrap();
+        let sig_rej = compute_refs_signature(&conn).unwrap();
+        assert_ne!(sig_rej, sig_ref2);
+        let vs_rej = score_analyzed_video(&conn, mid, Some(pid), &refs_v2, 0.75).unwrap();
+        assert_eq!(vs_rej.segments, vec![[2.0, 3.0]]);
+        let _ = fid_frame1;
+
+        // 5. Delete ref 2 -> signature changes, photo sim drops back to 0.6
+        conn.execute("DELETE FROM refs WHERE id=?1", [ref2_id]).unwrap();
+        let sig_del_ref2 = compute_refs_signature(&conn).unwrap();
+        assert_ne!(sig_del_ref2, sig_rej);
+        let refs_v3 = media::person_refs(&conn, pid).unwrap();
+        let (photo_sim3, _) = score_faces(&photo_faces, &refs_v3);
+        assert!((photo_sim3 - 0.6).abs() < 1e-5);
+
+        // 6. Delete remaining ref -> 0 refs gives 0 score & empty segments
+        conn.execute("DELETE FROM refs WHERE id=?1", [ref1_id]).unwrap();
+        let sig_zero_refs = compute_refs_signature(&conn).unwrap();
+        assert_ne!(sig_zero_refs, sig_del_ref2);
+        let refs_empty = media::person_refs(&conn, pid).unwrap();
+        assert!(refs_empty.is_empty());
+        let vs_zero = score_analyzed_video(&conn, mid, Some(pid), &refs_empty, 0.40).unwrap();
+        assert_eq!(vs_zero.max_score, 0.0);
+        assert!(vs_zero.segments.is_empty());
+
+        // 7. Delete rejections + person -> returns to empty signature
+        conn.execute("DELETE FROM rejections WHERE person_id=?1", [pid]).unwrap();
+        conn.execute("DELETE FROM persons WHERE id=?1", [pid]).unwrap();
+        assert_eq!(compute_refs_signature(&conn).unwrap(), sig_empty);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&tmp);
     }
 }

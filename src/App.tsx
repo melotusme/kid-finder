@@ -7,13 +7,16 @@ import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { api, src, fmtTime, parseTime, padSegments, loadClipSettings, saveClipSettings, type ClipSettings, type Status, type Person, type Hit, type Progress, type ImportReport, type Album, type LoginTicket, type ExtensionInstallResult } from "./api";
 
-type Tab = "kids" | "import" | "results" | "settings";
+type Tab = "kids" | "import" | "photos" | "videos" | "settings";
 const MEDIA_EXT = ["jpg", "jpeg", "png", "webp", "bmp", "gif", "mp4", "mov", "m4v", "avi", "mkv", "3gp", "webm"];
 
 export default function App() {
   const [tab, setTab] = useState<Tab>("kids");
   const [status, setStatus] = useState<Status | null>(null);
   const [persons, setPersons] = useState<Person[]>([]);
+  const [selectedPersonId, setSelectedPersonId] = useState<number | null>(null);
+  const [threshold, setThreshold] = useState<number>(0.4);
+  const thresholdSynced = useRef(false);
   const [progress, setProgress] = useState<Progress | null>(null);
   const [dl, setDl] = useState<{ label: string; done: number; total: number | null } | null>(null);
   const [toast, setToast] = useState<string | null>(null);
@@ -24,11 +27,27 @@ export default function App() {
     const [s, p] = await Promise.all([api.status(), api.persons()]);
     setStatus(s);
     setPersons(p);
+    if (!thresholdSynced.current) {
+      setThreshold(s.threshold);
+      thresholdSynced.current = true;
+    }
   }, []);
   const notify = (m: string) => {
     setToast(m);
     setTimeout(() => setToast((t) => (t === m ? null : t)), 6000);
   };
+
+  useEffect(() => {
+    if (selectedPersonId === null || !persons.some((p) => p.id === selectedPersonId)) {
+      const next = persons[0]?.id ?? null;
+      if (selectedPersonId !== next) setSelectedPersonId(next);
+    }
+  }, [persons, selectedPersonId]);
+
+  const activePid =
+    selectedPersonId !== null && persons.some((p) => p.id === selectedPersonId)
+      ? selectedPersonId
+      : (persons[0]?.id ?? null);
 
   const triggerInstallExtension = useCallback(async () => {
     try {
@@ -71,7 +90,8 @@ export default function App() {
           [
             ["kids", "① 录入宝宝"],
             ["import", "② 导入照片视频"],
-            ["results", "③ 找到的宝宝"],
+            ["photos", "③ 宝宝照片"],
+            ["videos", "④ 宝宝视频"],
             ["settings", "设置"],
           ] as [Tab, string][]
         ).map(([k, label]) => (
@@ -136,7 +156,32 @@ export default function App() {
         {tab === "import" && status && (
           <Import status={status} persons={persons} onInstallExt={triggerInstallExtension} refresh={refresh} notify={notify} />
         )}
-        {tab === "results" && status && <Results persons={persons} status={status} refresh={refresh} notify={notify} />}
+        {tab === "photos" && status && (
+          <PhotosView
+            persons={persons}
+            status={status}
+            pid={activePid}
+            onSelectPid={setSelectedPersonId}
+            threshold={threshold}
+            onChangeThreshold={setThreshold}
+            onGoKids={() => setTab("kids")}
+            refresh={refresh}
+            notify={notify}
+          />
+        )}
+        {tab === "videos" && status && (
+          <VideosView
+            persons={persons}
+            status={status}
+            pid={activePid}
+            onSelectPid={setSelectedPersonId}
+            threshold={threshold}
+            onChangeThreshold={setThreshold}
+            onGoKids={() => setTab("kids")}
+            refresh={refresh}
+            notify={notify}
+          />
+        )}
         {tab === "settings" && status && (
           <Settings status={status} persons={persons} onInstallExt={triggerInstallExtension} refresh={refresh} notify={notify} />
         )}
@@ -314,8 +359,8 @@ function Import({
     <section>
       <h2>导入照片和视频</h2>
       <p className="hint">
-        把微信里保存下来的照片/视频（或整个文件夹）拖进来。同一个文件导入过会自动识别并提示，不会重复导入。
-        {!status.ffmpeg && <b className="warn"> 处理视频需要 ffmpeg，请到「设置」安装。</b>}
+        把微信里保存下来的照片/视频（或整个文件夹）拖进来，照片与视频会自动分类归档到「③ 宝宝照片」与「④ 宝宝视频」。同一个文件导入过会自动跳过，不会重复导入。
+        {!status.ffmpeg && <b className="warn"> 处理视频需要 ffmpeg，请到「④ 宝宝视频」或「设置」一键安装。</b>}
       </p>
       <div className={"drop" + (hover ? " hover" : "")}>
         <div>拖放文件或文件夹到这里</div>
@@ -445,34 +490,66 @@ function Qxc({ status, refresh, notify }: Common & { status: Status }) {
   );
 }
 
-function Results({ persons, status, refresh, notify }: Common & { persons: Person[]; status: Status }) {
-  const [pid, setPid] = useState<number | null>(persons[0]?.id ?? null);
-  const [threshold, setThreshold] = useState(status.threshold);
+type MediaViewProps = Common & {
+  persons: Person[];
+  status: Status;
+  pid: number | null;
+  onSelectPid: (id: number) => void;
+  threshold: number;
+  onChangeThreshold: (v: number) => void;
+  onGoKids: () => void;
+};
+
+function usePersonHits({
+  kind,
+  persons,
+  pid,
+  threshold,
+  refsSignature,
+  pending,
+  notify,
+}: {
+  kind: "image" | "video";
+  persons: Person[];
+  pid: number | null;
+  threshold: number;
+  refsSignature: string;
+  pending: number;
+  notify: (m: string) => void;
+}) {
   const [hits, setHits] = useState<Hit[]>([]);
   const [selected, setSelected] = useState<Set<number>>(new Set());
-  const [filter, setFilter] = useState<"all" | "image" | "video">("all");
-  const [preview, setPreview] = useState<Hit | null>(null);
-  const [clip, setClip] = useState<ClipSettings>(loadClipSettings);
-  const [edits, setEdits] = useState<Record<number, [number, number][]>>({});
-  const setClipS = (c: ClipSettings) => {
-    setClip(c);
-    saveClipSettings(c);
-  };
-  const segsOf = (h: Hit) => edits[h.mediaId] ?? padSegments(h.segments, clip, h.duration);
+  const [loading, setLoading] = useState(false);
+  const reqSeq = useRef(0);
+
+  const currentPerson = persons.find((p) => p.id === pid) ?? null;
+  const refsKey = currentPerson?.refs.map((r) => r.id).join(",") ?? "";
+  const hasRefs = (currentPerson?.refs.length ?? 0) > 0;
+
   const load = useCallback(async () => {
-    if (pid === null) return;
-    const h = await api.search(pid, threshold);
-    setHits(h);
-    setSelected(new Set(h.map((x) => x.mediaId)));
-  }, [pid, threshold]);
+    const seq = ++reqSeq.current;
+    if (pid === null || !currentPerson || !hasRefs) {
+      setHits([]);
+      setSelected(new Set());
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
+    try {
+      const all = await api.search(pid, threshold);
+      if (seq !== reqSeq.current) return;
+      const filtered = all.filter((h) => h.kind === kind);
+      setHits(filtered);
+      setSelected(new Set(filtered.map((x) => x.mediaId)));
+    } finally {
+      if (seq === reqSeq.current) setLoading(false);
+    }
+  }, [pid, currentPerson?.id, hasRefs, refsKey, refsSignature, threshold, kind]);
 
   useEffect(() => {
     load().catch((e) => notify(String(e)));
-  }, [load, status.pending]);
+  }, [load, pending]);
 
-  if (!persons.length) return <section><p className="hint">请先在「录入宝宝」里添加孩子和参考照。</p></section>;
-
-  const shown = hits.filter((h) => filter === "all" || h.kind === filter);
   const toggle = (id: number) =>
     setSelected((s) => {
       const n = new Set(s);
@@ -480,15 +557,45 @@ function Results({ persons, status, refresh, notify }: Common & { persons: Perso
       return n;
     });
 
+  return { hits, selected, setSelected, loading, currentPerson, hasRefs, load, toggle };
+}
+
+function PhotosView({ persons, status, pid, onSelectPid, threshold, onChangeThreshold, onGoKids, refresh, notify }: MediaViewProps) {
+  const { hits, selected, setSelected, loading, currentPerson, hasRefs, load, toggle } = usePersonHits({
+    kind: "image",
+    persons,
+    pid,
+    threshold,
+    refsSignature: status.refsSignature,
+    pending: status.pending,
+    notify,
+  });
+  const [preview, setPreview] = useState<Hit | null>(null);
+
+  useEffect(() => {
+    setPreview((prev) => (prev ? hits.find((x) => x.mediaId === prev.mediaId) ?? null : null));
+  }, [hits]);
+
+  if (!persons.length) {
+    return (
+      <section>
+        <div className="card empty-card">
+          <p className="hint">请先在「① 录入宝宝」里添加孩子和清晰的正脸参考照。</p>
+          <button onClick={onGoKids}>去「① 录入宝宝」添加</button>
+        </div>
+      </section>
+    );
+  }
+
   const doExport = async () => {
-    const dir = await open({ directory: true, title: "导出到哪个文件夹？" });
+    const dir = await open({ directory: true, title: "导出照片到哪个文件夹？" });
     if (!dir) return;
-    const items = hits.filter((h) => selected.has(h.mediaId)).map((h) => ({ mediaId: h.mediaId, segments: h.kind === "video" ? segsOf(h) : [] }));
+    const items = hits.filter((h) => selected.has(h.mediaId)).map((h) => ({ mediaId: h.mediaId, segments: [] as [number, number][] }));
     try {
-      const r = await api.exportItems(dir as string, items, clip.fade);
+      const r = await api.exportItems(dir as string, items, 0);
       notify(
-        `已导出 ${r.images} 张照片、${r.clips} 段视频` +
-          (r.skipped ? `，${r.skipped} 个已存在跳过` : "") +
+        `已导出 ${r.images} 张照片` +
+          (r.skipped ? `，${r.skipped} 张已存在跳过` : "") +
           (r.errors.length ? `，失败：${r.errors.join("；")}` : ""),
       );
       openPath(dir as string).catch(() => {});
@@ -500,17 +607,12 @@ function Results({ persons, status, refresh, notify }: Common & { persons: Perso
   return (
     <section>
       <div className="row toolbar">
-        <select value={pid ?? ""} onChange={(e) => setPid(Number(e.target.value))}>
+        <select value={pid ?? ""} onChange={(e) => onSelectPid(Number(e.target.value))}>
           {persons.map((p) => (
             <option key={p.id} value={p.id}>
               {p.name}
             </option>
           ))}
-        </select>
-        <select value={filter} onChange={(e) => setFilter(e.target.value as typeof filter)}>
-          <option value="all">全部</option>
-          <option value="image">只看照片</option>
-          <option value="video">只看视频</option>
         </select>
         <label className="muted" title="越高越严格：漏掉的多，认错的少">
           严格程度 {threshold.toFixed(2)}
@@ -520,103 +622,115 @@ function Results({ persons, status, refresh, notify }: Common & { persons: Perso
             max={0.65}
             step={0.01}
             value={threshold}
-            onChange={(e) => setThreshold(Number(e.target.value))}
+            onChange={(e) => onChangeThreshold(Number(e.target.value))}
             onMouseUp={() => api.setThreshold(threshold)}
+            onTouchEnd={() => api.setThreshold(threshold)}
+            onKeyUp={() => api.setThreshold(threshold)}
           />
         </label>
+        <button
+          className="ghost"
+          disabled={loading}
+          onClick={() =>
+            refresh()
+              .then(() => load())
+              .then(() => notify(hasRefs ? "已重新计算相似度" : "请先在「① 录入宝宝」添加参考照"))
+              .catch((e) => notify(String(e)))
+          }
+        >
+          {loading ? "计算中…" : "重新计算"}
+        </button>
         <div className="spacer" />
         <span className="muted">
-          找到 {shown.length} 个 · 已选 {selected.size}
+          找到 {hits.length} 张照片 · 已选 {selected.size}
         </span>
-        <button className="ghost" onClick={() => setSelected(new Set(selected.size ? [] : hits.map((h) => h.mediaId)))}>
+        <button className="ghost" disabled={!hits.length} onClick={() => setSelected(new Set(selected.size ? [] : hits.map((h) => h.mediaId)))}>
           {selected.size ? "全不选" : "全选"}
         </button>
         <button disabled={!selected.size} onClick={doExport}>
-          导出选中
+          导出选中照片
         </button>
       </div>
-      <p className="hint">视频只会导出孩子出现的片段，点开视频可以逐段微调起止时间。认错了点 ✕，认对了点 ✓ 可以让识别越来越准。</p>
-      {hits.some((h) => h.kind === "video") && (
-        <div className="row card cliprow">
-          <b>视频片段</b>
-          <label>
-            宝宝出现前提前
-            <input type="number" min={0} max={30} step={0.5} value={clip.lead} onChange={(e) => setClipS({ ...clip, lead: Math.max(0, Number(e.target.value)) })} />
-            秒开始
-          </label>
-          <label>
-            离开后多留
-            <input type="number" min={0} max={30} step={0.5} value={clip.tail} onChange={(e) => setClipS({ ...clip, tail: Math.max(0, Number(e.target.value)) })} />
-            秒
-          </label>
-          <label>
-            淡入淡出
-            <input type="number" min={0} max={3} step={0.1} value={clip.fade} onChange={(e) => setClipS({ ...clip, fade: Math.max(0, Number(e.target.value)) })} />
-            秒（0 为直接切）
-          </label>
+      {!hasRefs ? (
+        <div className="card empty-card">
+          <p className="hint">「{currentPerson?.name ?? "该宝宝"}」还没有参考照，请先到「① 录入宝宝」添加至少一张清晰的正脸照片。</p>
+          <button onClick={onGoKids}>去「① 录入宝宝」添加参考照</button>
         </div>
-      )}
-      <div className="grid">
-        {shown.map((h) => (
-          <div key={h.mediaId} className={"tile" + (selected.has(h.mediaId) ? " sel" : "")}>
-            <div className="imgwrap" onClick={() => setPreview(h)}>
-              <img src={src(h.kind === "image" ? h.path : h.poster)} loading="lazy" />
-              {h.kind === "image" && (
-                <div
-                  className="box"
-                  style={{
-                    left: `${h.bbox[0] * 100}%`,
-                    top: `${h.bbox[1] * 100}%`,
-                    width: `${(h.bbox[2] - h.bbox[0]) * 100}%`,
-                    height: `${(h.bbox[3] - h.bbox[1]) * 100}%`,
-                  }}
-                />
-              )}
-              {h.kind === "video" && (
-                <div className="badge">
-                  ▶ {segsOf(h).length} 段 · {fmtTime(segsOf(h).reduce((s, [a, b]) => s + b - a, 0))}
-                  {h.mediaId in edits && " · 已手动调整"}
+      ) : (
+        <>
+          <p className="hint">认错了点 ✕ 排除，认对了点 ✓ 加入参考照，每次增删或确认参考照都会自动重算全部照片相似度。</p>
+          {hits.length === 0 ? (
+            <div className="card empty-card">
+              <p className="hint" style={{ margin: 0 }}>
+                {status.images === 0
+                  ? "库内还没有导入照片，请先到「② 导入照片视频」导入。"
+                  : "当前严格程度下没有找到匹配照片，可适当调低严格程度或补充更多角度的参考照。"}
+              </p>
+            </div>
+          ) : (
+            <div className="grid">
+              {hits.map((h) => (
+                <div key={h.mediaId} className={"tile" + (selected.has(h.mediaId) ? " sel" : "")}>
+                  <div className="imgwrap" onClick={() => setPreview(h)}>
+                    <img src={src(h.path)} loading="lazy" />
+                    <div
+                      className="box"
+                      style={{
+                        left: `${h.bbox[0] * 100}%`,
+                        top: `${h.bbox[1] * 100}%`,
+                        width: `${(h.bbox[2] - h.bbox[0]) * 100}%`,
+                        height: `${(h.bbox[3] - h.bbox[1]) * 100}%`,
+                      }}
+                    />
+                  </div>
+                  <div className="row tilebar">
+                    <input type="checkbox" checked={selected.has(h.mediaId)} onChange={() => toggle(h.mediaId)} />
+                    <span className="muted small">
+                      {h.time.slice(0, 10)} · {(h.score * 100).toFixed(0)}%
+                    </span>
+                    <div className="spacer" />
+                    <button
+                      className="icon"
+                      title="是我家宝宝（加入参考并重算）"
+                      onClick={() =>
+                        api
+                          .confirmFace(h.faceId, pid!)
+                          .then(() => {
+                            notify("已加入参考，已重新计算相似度");
+                            return refresh();
+                          })
+                          .catch((e) => notify(String(e)))
+                      }
+                    >
+                      ✓
+                    </button>
+                    <button
+                      className="icon"
+                      title="不是我家宝宝"
+                      onClick={() =>
+                        api
+                          .rejectFace(h.faceId, pid!)
+                          .then(() => refresh())
+                          .catch((e) => notify(String(e)))
+                      }
+                    >
+                      ✕
+                    </button>
+                  </div>
                 </div>
-              )}
+              ))}
             </div>
-            <div className="row tilebar">
-              <input type="checkbox" checked={selected.has(h.mediaId)} onChange={() => toggle(h.mediaId)} />
-              <span className="muted small">
-                {h.time.slice(0, 10)} · {(h.score * 100).toFixed(0)}%
-              </span>
-              <div className="spacer" />
-              <button className="icon" title="是我家宝宝（加入参考）" onClick={() => api.confirmFace(h.faceId, pid!).then(() => { notify("已加入参考"); refresh(); })}>
-                ✓
-              </button>
-              <button className="icon" title="不是我家宝宝" onClick={() => api.rejectFace(h.faceId, pid!).then(load)}>
-                ✕
-              </button>
-            </div>
-          </div>
-        ))}
-      </div>
+          )}
+        </>
+      )}
       {preview && (
         <div className="modal" onClick={() => setPreview(null)}>
           <div onClick={(e) => e.stopPropagation()}>
-            {preview.kind === "image" ? (
-              <img src={src(preview.path)} />
-            ) : (
-              <VideoPreview
-                hit={preview}
-                segs={segsOf(preview)}
-                edited={preview.mediaId in edits}
-                onChange={(s) =>
-                  setEdits((e) => {
-                    const n = { ...e };
-                    if (s === null) delete n[preview.mediaId];
-                    else n[preview.mediaId] = s;
-                    return n;
-                  })
-                }
-              />
-            )}
+            <img src={src(preview.path)} />
             <div className="row">
-              <span>{preview.origName}</span>
+              <span>
+                {preview.origName} <span className="muted small">· 相似度 {(preview.score * 100).toFixed(0)}%</span>
+              </span>
               <div className="spacer" />
               <button className="ghost" onClick={() => revealItemInDir(preview.path)}>
                 在文件夹中显示
@@ -630,7 +744,289 @@ function Results({ persons, status, refresh, notify }: Common & { persons: Perso
   );
 }
 
-function VideoPreview({ hit, segs, edited, onChange }: { hit: Hit; segs: [number, number][]; edited: boolean; onChange: (s: [number, number][] | null) => void }) {
+function VideosView({ persons, status, pid, onSelectPid, threshold, onChangeThreshold, onGoKids, refresh, notify }: MediaViewProps) {
+  const { hits, selected, setSelected, loading, currentPerson, hasRefs, load, toggle } = usePersonHits({
+    kind: "video",
+    persons,
+    pid,
+    threshold,
+    refsSignature: status.refsSignature,
+    pending: status.pending,
+    notify,
+  });
+  const [clip, setClip] = useState<ClipSettings>(loadClipSettings);
+  const [edits, setEdits] = useState<Record<string, [number, number][]>>({});
+  const [preview, setPreview] = useState<{ hit: Hit; initialRange: [number, number] | null } | null>(null);
+  const [installingFfmpeg, setInstallingFfmpeg] = useState(false);
+
+  const setClipS = (c: ClipSettings) => {
+    setClip(c);
+    saveClipSettings(c);
+  };
+  const editKey = (mediaId: number) => `${pid ?? "none"}:${mediaId}`;
+  const segsOf = (h: Hit) => edits[editKey(h.mediaId)] ?? padSegments(h.segments, clip, h.duration);
+
+  useEffect(() => {
+    setPreview((prev) => {
+      if (!prev) return null;
+      const updated = hits.find((x) => x.mediaId === prev.hit.mediaId);
+      return updated ? { hit: updated, initialRange: prev.initialRange } : null;
+    });
+  }, [hits]);
+
+  if (!persons.length) {
+    return (
+      <section>
+        <div className="card empty-card">
+          <p className="hint">请先在「① 录入宝宝」里添加孩子和清晰的正脸参考照。</p>
+          <button onClick={onGoKids}>去「① 录入宝宝」添加</button>
+        </div>
+      </section>
+    );
+  }
+
+  const totalClips = hits.reduce((sum, h) => sum + segsOf(h).length, 0);
+
+  const doExport = async () => {
+    const dir = await open({ directory: true, title: "裁剪导出视频片段到哪个文件夹？" });
+    if (!dir) return;
+    const items = hits.filter((h) => selected.has(h.mediaId)).map((h) => ({ mediaId: h.mediaId, segments: segsOf(h) }));
+    try {
+      const r = await api.exportItems(dir as string, items, clip.fade);
+      notify(
+        `已导出 ${r.clips} 段视频片段` +
+          (r.images ? `、${r.images} 个完整视频` : "") +
+          (r.skipped ? `，${r.skipped} 个已存在跳过` : "") +
+          (r.errors.length ? `，失败：${r.errors.join("；")}` : ""),
+      );
+      openPath(dir as string).catch(() => {});
+    } catch (e) {
+      notify(String(e));
+    }
+  };
+
+  return (
+    <section>
+      {!status.ffmpeg && (
+        <div className="ffmpeg-banner">
+          <span>
+            <b>尚未安装 ffmpeg：</b>分析视频抽帧与裁剪导出宝宝片段需要 ffmpeg。
+          </span>
+          <div className="spacer" />
+          <button
+            disabled={installingFfmpeg}
+            onClick={async () => {
+              setInstallingFfmpeg(true);
+              try {
+                await api.installFfmpeg();
+                notify("ffmpeg 安装完成");
+                await refresh();
+              } catch (e) {
+                notify(String(e));
+              }
+              setInstallingFfmpeg(false);
+            }}
+          >
+            {installingFfmpeg ? "安装中…" : "一键安装 ffmpeg"}
+          </button>
+        </div>
+      )}
+      <div className="row card cliprow">
+        <b>视频片段裁剪</b>
+        <label>
+          宝宝出现前提前
+          <input type="number" min={0} max={30} step={0.5} value={clip.lead} onChange={(e) => setClipS({ ...clip, lead: Math.max(0, Number(e.target.value)) })} />
+          秒开始
+        </label>
+        <label>
+          离开后多留
+          <input type="number" min={0} max={30} step={0.5} value={clip.tail} onChange={(e) => setClipS({ ...clip, tail: Math.max(0, Number(e.target.value)) })} />
+          秒
+        </label>
+        <label>
+          淡入淡出
+          <input type="number" min={0} max={3} step={0.1} value={clip.fade} onChange={(e) => setClipS({ ...clip, fade: Math.max(0, Number(e.target.value)) })} />
+          秒（0 为直接切）
+        </label>
+      </div>
+      <div className="row toolbar">
+        <select value={pid ?? ""} onChange={(e) => onSelectPid(Number(e.target.value))}>
+          {persons.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.name}
+            </option>
+          ))}
+        </select>
+        <label className="muted" title="越高越严格：漏掉的多，认错的少">
+          严格程度 {threshold.toFixed(2)}
+          <input
+            type="range"
+            min={0.25}
+            max={0.65}
+            step={0.01}
+            value={threshold}
+            onChange={(e) => onChangeThreshold(Number(e.target.value))}
+            onMouseUp={() => api.setThreshold(threshold)}
+            onTouchEnd={() => api.setThreshold(threshold)}
+            onKeyUp={() => api.setThreshold(threshold)}
+          />
+        </label>
+        <button
+          className="ghost"
+          disabled={loading}
+          onClick={() =>
+            refresh()
+              .then(() => load())
+              .then(() => notify(hasRefs ? "已重新计算相似度" : "请先在「① 录入宝宝」添加参考照"))
+              .catch((e) => notify(String(e)))
+          }
+        >
+          {loading ? "计算中…" : "重新计算"}
+        </button>
+        <div className="spacer" />
+        <span className="muted">
+          找到 {hits.length} 个视频（共 {totalClips} 段片段）· 已选 {selected.size}
+        </span>
+        <button className="ghost" disabled={!hits.length} onClick={() => setSelected(new Set(selected.size ? [] : hits.map((h) => h.mediaId)))}>
+          {selected.size ? "全不选" : "全选"}
+        </button>
+        <button disabled={!selected.size} onClick={doExport}>
+          裁剪导出选中片段
+        </button>
+      </div>
+      {!hasRefs ? (
+        <div className="card empty-card">
+          <p className="hint">「{currentPerson?.name ?? "该宝宝"}」还没有参考照，请先到「① 录入宝宝」添加至少一张清晰的正脸照片。</p>
+          <button onClick={onGoKids}>去「① 录入宝宝」添加参考照</button>
+        </div>
+      ) : (
+        <>
+          <p className="hint">视频只导出宝宝出现的片段，点击时间胶囊可直接试看对应片段，点开视频可逐段微调起止时间。</p>
+          {hits.length === 0 ? (
+            <div className="card empty-card">
+              <p className="hint" style={{ margin: 0 }}>
+                {status.videos === 0
+                  ? "库内还没有导入视频，请先到「② 导入照片视频」导入。"
+                  : "当前严格程度下没有找到匹配视频片段，可适当调低严格程度或补充更多角度的参考照。"}
+              </p>
+            </div>
+          ) : (
+            <div className="video-grid">
+              {hits.map((h) => {
+                const segs = segsOf(h);
+                const clipSum = segs.reduce((s, [a, b]) => s + b - a, 0);
+                const isEdited = editKey(h.mediaId) in edits;
+                return (
+                  <div key={h.mediaId} className={"tile video-card" + (selected.has(h.mediaId) ? " sel" : "")}>
+                    <div className="vidwrap" onClick={() => setPreview({ hit: h, initialRange: null })}>
+                      {h.poster ? <img src={src(h.poster)} loading="lazy" /> : <div className="noposter">▶ 视频预览</div>}
+                      <div className="badge">
+                        ▶ {segs.length} 段 · 共 {fmtTime(clipSum)}
+                        {isEdited && " · 已手动调整"}
+                      </div>
+                      {h.duration !== null && <div className="dur-badge">总长 {fmtTime(h.duration)}</div>}
+                    </div>
+                    {segs.length > 0 && (
+                      <div className="seg-chips">
+                        {segs.map(([a, b], idx) => (
+                          <button
+                            key={idx}
+                            className="seg-chip"
+                            title="点击试看并微调该片段"
+                            onClick={() => setPreview({ hit: h, initialRange: [a, b] })}
+                          >
+                            {fmtTime(a)}–{fmtTime(b)}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                    <div className="row tilebar">
+                      <input type="checkbox" checked={selected.has(h.mediaId)} onChange={() => toggle(h.mediaId)} />
+                      <span className="muted small">
+                        {h.time.slice(0, 10)} · {(h.score * 100).toFixed(0)}%
+                      </span>
+                      <div className="spacer" />
+                      <button
+                        className="icon"
+                        title="是我家宝宝（加入参考并重算）"
+                        onClick={() =>
+                          api
+                            .confirmFace(h.faceId, pid!)
+                            .then(() => {
+                              notify("已加入参考，已重新计算相似度");
+                              return refresh();
+                            })
+                            .catch((e) => notify(String(e)))
+                        }
+                      >
+                        ✓
+                      </button>
+                      <button
+                        className="icon"
+                        title="不是我家宝宝"
+                        onClick={() =>
+                          api
+                            .rejectFace(h.faceId, pid!)
+                            .then(() => refresh())
+                            .catch((e) => notify(String(e)))
+                        }
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </>
+      )}
+      {preview && (
+        <div className="modal" onClick={() => setPreview(null)}>
+          <div onClick={(e) => e.stopPropagation()}>
+            <VideoPreview
+              hit={preview.hit}
+              segs={segsOf(preview.hit)}
+              initialRange={preview.initialRange}
+              edited={editKey(preview.hit.mediaId) in edits}
+              onChange={(s) =>
+                setEdits((e) => {
+                  const n = { ...e };
+                  const k = editKey(preview.hit.mediaId);
+                  if (s === null) delete n[k];
+                  else n[k] = s;
+                  return n;
+                })
+              }
+            />
+            <div className="row">
+              <span>{preview.hit.origName}</span>
+              <div className="spacer" />
+              <button className="ghost" onClick={() => revealItemInDir(preview.hit.path)}>
+                在文件夹中显示
+              </button>
+              <button onClick={() => setPreview(null)}>关闭</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function VideoPreview({
+  hit,
+  segs,
+  initialRange,
+  edited,
+  onChange,
+}: {
+  hit: Hit;
+  segs: [number, number][];
+  initialRange?: [number, number] | null;
+  edited: boolean;
+  onChange: (s: [number, number][] | null) => void;
+}) {
   const ref = useRef<HTMLVideoElement>(null);
   const stopAt = useRef<number | null>(null);
   const now = () => Math.round((ref.current?.currentTime ?? 0) * 10) / 10;
@@ -652,7 +1048,15 @@ function VideoPreview({ hit, segs, edited, onChange }: { hit: Hit; segs: [number
         src={src(hit.path)}
         controls
         autoPlay
-        onLoadedMetadata={() => ref.current && (ref.current.currentTime = segs[0]?.[0] ?? 0)}
+        onLoadedMetadata={() => {
+          if (!ref.current) return;
+          if (initialRange) {
+            stopAt.current = initialRange[1];
+            ref.current.currentTime = initialRange[0];
+          } else {
+            ref.current.currentTime = segs[0]?.[0] ?? 0;
+          }
+        }}
         onTimeUpdate={() => {
           const v = ref.current;
           if (v && stopAt.current !== null && v.currentTime >= stopAt.current) {
