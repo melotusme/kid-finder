@@ -20,6 +20,7 @@
     offlineMsg: "",
     persons: [],
     personId: null,
+    refsSignature: null,
     threshold: 0.4,
     totalDbScanned: 0,
     totalVideoScanned: 0,
@@ -34,6 +35,7 @@
     includeCached: false, // false = 仅勾选/裁剪本次新增命中；true = 同时包含已扫存量命中
     onlyMatched: false,
     showEnroll: false,
+    enrolling: false,
     scanning: false,
     clipping: false,
     stopRequested: false,
@@ -262,6 +264,16 @@
    */
   async function syncPageScannedState(autoDecorate = true) {
     if (!state.connected) return;
+    const person = state.persons.find((p) => p.id === state.personId);
+    if (!person || person.refCount === 0) {
+      state.results.clear();
+      updatePageCounts();
+      if (autoDecorate) {
+        document.querySelectorAll(".imgItem").forEach(clearTileDecoration);
+      }
+      render();
+      return;
+    }
     const all = collectPageItems();
     const unknownIds = [];
     const seen = new Set();
@@ -397,6 +409,20 @@
       };
     }
     render();
+  }
+
+  function clearPageResultsAndChecks(uncheckBatch = true) {
+    state.results.clear();
+    state.matchedPhotoCount = 0;
+    state.matchedVideoCount = 0;
+    state.checkedCount = 0;
+    document.querySelectorAll(".imgItem").forEach(clearTileDecoration);
+    if (uncheckBatch && isBatchMode()) {
+      for (const el of document.querySelectorAll(".imgItem")) {
+        setItemChecked(el, false);
+      }
+    }
+    updatePageCounts();
   }
 
   function uncheckAllOnPage() {
@@ -715,8 +741,10 @@
     }
   }
 
-  async function refreshStatus() {
+  async function refreshStatus(opts = {}) {
+    const preserveNotice = Boolean(opts && opts.preserveNotice);
     const resp = await bridge("GET", "/api/status");
+    if (state.scanning || state.clipping || state.enrolling) return;
     if (!resp.ok || !resp.data || !resp.data.ok) {
       state.connected = false;
       state.offlineMsg = "未连接到本机「找娃助手」桌面端，请先打开找娃助手应用。";
@@ -740,52 +768,102 @@
       const withRefs = state.persons.find((p) => p.refCount > 0);
       state.personId = withRefs ? withRefs.id : state.persons[0] ? state.persons[0].id : null;
     }
-    if (state.persons.some((p) => p.refCount > 0)) {
+    const selectedPerson = state.persons.find((p) => p.id === state.personId);
+
+    const nextSig =
+      d.refsSignature || JSON.stringify((d.persons || []).map((p) => [p.id, p.name, p.refCount]));
+    const sigChanged = state.refsSignature !== null && state.refsSignature !== nextSig;
+    state.refsSignature = nextSig;
+
+    if (sigChanged) {
+      state.results.clear();
+      if (!selectedPerson || selectedPerson.refCount === 0) {
+        clearPageResultsAndChecks(true);
+        if (!preserveNotice) {
+          state.notice = {
+            type: "warn",
+            text: "当前宝宝暂无参考照，已清除页面相似度标注并取消勾选。",
+          };
+        }
+        render();
+        return;
+      }
       state.showEnroll = false;
+      await syncPageScannedState(false);
+      await applySelection(true);
+      if (!preserveNotice) {
+        state.notice = {
+          type: "ok",
+          text: "参考照已更新，已重新计算当前页所有已扫照片/视频的相似度。",
+        };
+      }
+      render();
+      return;
     }
+
+    if (!selectedPerson || selectedPerson.refCount === 0) {
+      clearPageResultsAndChecks(true);
+      render();
+      return;
+    }
+
     await syncPageScannedState(true);
   }
 
   async function handleEnrollUpload(nameInput, fileList) {
-    if (!fileList || fileList.length === 0) return;
-    const files = Array.from(fileList).slice(0, 8);
-    const images = [];
-    for (const f of files) {
-      const dataUrl = await new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(String(reader.result || ""));
-        reader.onerror = reject;
-        reader.readAsDataURL(f);
-      });
-      images.push(dataUrl);
-    }
+    if (!fileList || fileList.length === 0 || state.enrolling) return;
+    state.enrolling = true;
+    let enrolledOk = false;
+    try {
+      const files = Array.from(fileList).slice(0, 8);
+      const images = [];
+      for (const f of files) {
+        const dataUrl = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result || ""));
+          reader.onerror = reject;
+          reader.readAsDataURL(f);
+        });
+        images.push(dataUrl);
+      }
 
-    const existing = state.persons.find((p) => p.id === state.personId);
-    const useExisting = Boolean(existing && !nameInput);
-    const payload = {
-      personId: useExisting ? existing.id : null,
-      name: useExisting ? existing.name : (nameInput || "宝宝").trim(),
-      images,
-    };
-    state.notice = { type: "warn", text: "正在提取宝宝人脸特征…" };
-    render();
-
-    const resp = await bridge("POST", "/api/enroll", payload);
-    if (!resp.ok || !resp.data || !resp.data.ok) {
-      state.notice = { type: "err", text: `录入失败：${(resp && resp.error) || (resp.data && resp.data.error) || "未知错误"}` };
+      const existing = state.persons.find((p) => p.id === state.personId);
+      const useExisting = Boolean(existing && !nameInput);
+      const payload = {
+        personId: useExisting ? existing.id : null,
+        name: useExisting ? existing.name : (nameInput || "宝宝").trim(),
+        images,
+      };
+      state.notice = { type: "warn", text: "正在提取宝宝人脸特征…" };
       render();
-      return;
+
+      const resp = await bridge("POST", "/api/enroll", payload);
+      if (!resp.ok || !resp.data || !resp.data.ok) {
+        state.notice = { type: "err", text: `录入失败：${(resp && resp.error) || (resp.data && resp.data.error) || "未知错误"}` };
+        return;
+      }
+      const r = resp.data;
+      state.personId = r.personId;
+      state.results.clear();
+      if (r.added > 0) {
+        state.showEnroll = false;
+      }
+      const parts = [`已录入 ${r.added} 张参考照`];
+      if (r.noFace > 0) parts.push(`${r.noFace} 张未检测到人脸`);
+      if (r.multiFace > 0) parts.push(`${r.multiFace} 张检测到多张脸（已取最大人脸）`);
+      if (r.added > 0) parts.push("已用本机缓存重新打分，无需重新下载");
+      state.notice = { type: r.added > 0 ? "ok" : "warn", text: parts.join("，") };
+      enrolledOk = true;
+    } catch (err) {
+      state.notice = { type: "err", text: `读取照片失败：${err.message || err}` };
+    } finally {
+      state.enrolling = false;
     }
-    const r = resp.data;
-    state.personId = r.personId;
-    state.results.clear();
-    state.showEnroll = false;
-    const parts = [`已录入 ${r.added} 张参考照`];
-    if (r.noFace > 0) parts.push(`${r.noFace} 张未检测到人脸`);
-    if (r.multiFace > 0) parts.push(`${r.multiFace} 张检测到多张脸（已取最大人脸）`);
-    parts.push("已用本机缓存重新打分，无需重新下载");
-    state.notice = { type: r.added > 0 ? "ok" : "warn", text: parts.join("，") };
-    await refreshStatus();
+    if (enrolledOk) {
+      await refreshStatus({ preserveNotice: true });
+    } else {
+      render();
+    }
   }
 
   // ---------------- UI ----------------
@@ -875,7 +953,7 @@
              </div>`;
 
     const pct = state.progressTotal > 0 ? Math.round((state.progressDone / state.progressTotal) * 100) : 0;
-    const busy = state.scanning || state.clipping;
+    const busy = state.scanning || state.clipping || state.enrolling;
     const hasScannedOnPage = state.results.size > 0;
     const matchedVideoIds = getMatchedVideoMediaIds(false);
 
@@ -885,7 +963,7 @@
           <span class="kf-title">找娃助手</span>
           ${statusTag}
           <div class="kf-spacer"></div>
-          <button class="kf-icon-btn" id="kf-refresh" title="刷新连接与增量状态">↻</button>
+          <button class="kf-icon-btn" id="kf-refresh" title="刷新连接并重新计算当前页相似度" ${busy ? 'disabled style="opacity:0.4;cursor:not-allowed;"' : ""}>↻</button>
           <button class="kf-icon-btn" id="kf-min" title="收起">—</button>
         </div>
         <div class="kf-body">
@@ -1013,9 +1091,17 @@
       };
     }
     if ($("#kf-refresh")) {
-      $("#kf-refresh").onclick = () => {
+      $("#kf-refresh").onclick = async () => {
+        if (state.scanning || state.clipping || state.enrolling) return;
         state.notice = null;
-        refreshStatus();
+        state.results.clear();
+        await refreshStatus();
+        const person = state.persons.find((p) => p.id === state.personId);
+        if (state.connected && person && person.refCount > 0 && state.results.size > 0) {
+          await applySelection(true);
+          state.notice = { type: "ok", text: "已刷新并重新计算相似度。" };
+          render();
+        }
       };
     }
     if ($("#kf-reconnect")) {
@@ -1024,12 +1110,20 @@
     if ($("#kf-person-select")) {
       $("#kf-person-select").onchange = async (e) => {
         state.personId = Number(e.target.value);
+        const person = state.persons.find((p) => p.id === state.personId);
+        if (!person || person.refCount === 0) {
+          clearPageResultsAndChecks(true);
+          state.notice = { type: "warn", text: "该宝宝尚未录入参考照，请先录入至少 1 张正脸照。" };
+          render();
+          return;
+        }
         state.results.clear();
         state.matchedPhotoCount = 0;
         state.matchedVideoCount = 0;
         state.checkedCount = 0;
         document.querySelectorAll(".imgItem").forEach(clearTileDecoration);
-        await syncPageScannedState(true);
+        await syncPageScannedState(false);
+        await applySelection(true);
         state.notice = { type: "ok", text: "已切换宝宝，已扫照片与视频已直接从本机缓存重算得分（无需重扫）。" };
         render();
       };
@@ -1169,6 +1263,24 @@
     }, 400);
   });
   observer.observe(document.body, { childList: true, subtree: true });
+
+  const AUTO_REFRESH_THROTTLE_MS = 1500;
+  let lastAutoRefreshAt = 0;
+
+  function maybeAutoRefresh() {
+    if (!state.open || state.scanning || state.clipping || state.enrolling) return;
+    const now = Date.now();
+    if (now - lastAutoRefreshAt < AUTO_REFRESH_THROTTLE_MS) return;
+    lastAutoRefreshAt = now;
+    refreshStatus();
+  }
+
+  window.addEventListener("focus", maybeAutoRefresh);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      maybeAutoRefresh();
+    }
+  });
 
   state.loadedCount = document.querySelectorAll(".imgItem").length;
   render();
