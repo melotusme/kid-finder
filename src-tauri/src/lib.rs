@@ -6,6 +6,8 @@ mod face;
 mod media;
 pub mod ocr;
 mod qxc;
+pub mod storage;
+pub mod wechat;
 
 use anyhow::{anyhow, Result};
 use rusqlite::{params, Connection};
