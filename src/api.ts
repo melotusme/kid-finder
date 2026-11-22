@@ -1,5 +1,7 @@
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 
+export type TaskState = "idle" | "running" | "paused" | "stopped";
+
 export type Status = {
   appVersion: string;
   extensionVersion: string;
@@ -7,9 +9,16 @@ export type Status = {
   ocrModelsReady: boolean;
   ffmpeg: string | null;
   processing: boolean;
+  analyzeState: TaskState;
+  qxcState: TaskState;
+  qxcActiveGroup: string | null;
+  wechatScanState: TaskState;
   total: number;
+  analyzed: number;
   pending: number;
   failed: number;
+  purged: number;
+  wechatCached: number;
   images: number;
   videos: number;
   qxcUser: string | null;
@@ -45,9 +54,10 @@ export type ImportReport = {
   duplicates: { name: string; existingName: string; importedAt: string }[];
   unsupported: number;
   errors: string[];
+  stopped?: boolean;
 };
 
-export type RefReport = { added: number; noFace: string[]; multiFace: string[]; errors: string[] };
+export type RefReport = { added: number; duplicates: string[]; noFace: string[]; multiFace: string[]; errors: string[] };
 
 export type Hit = {
   mediaId: number;
@@ -70,7 +80,7 @@ export type Hit = {
 
 export type ExportReport = { images: number; clips: number; skipped: number; errors: string[] };
 export type Album = { groupId: string; groupName: string; imgCnt: number; videoCnt: number; lastUploadTime?: string };
-export type SyncReport = { added: number; duplicates: number; errors: string[]; complete: boolean };
+export type SyncReport = { added: number; duplicates: number; errors: string[]; complete: boolean; stopped?: boolean };
 export type LoginTicket = { token: string; qrSvg: string; expiresInMs: number };
 export type Progress = { stage: "import" | "analyze" | "export"; done: number; total: number; current: string };
 export type ThumbUpdate = { mediaId: number; poster: string };
@@ -132,13 +142,21 @@ export const api = {
     invoke<void>("update_person_profile", { id, name, aliases }),
   deletePerson: (id: number) => invoke<void>("delete_person", { id }),
   addRefs: (personId: number, paths: string[]) => invoke<RefReport>("add_refs", { personId, paths }),
+  dedupPersonRefs: (personId: number) => invoke<number>("dedup_person_refs", { personId }),
   deleteRef: (id: number) => invoke<void>("delete_ref", { id }),
   importPaths: (paths: string[]) => invoke<ImportReport>("import_paths", { paths }),
   discoverWechat: () => invoke<WechatSource[]>("discover_wechat"),
-  importWechatVideos: () => invoke<ImportReport>("import_wechat_videos"),
+  importWechatVideos: (restart = false) => invoke<ImportReport>("import_wechat_videos", { restart }),
+  pauseWechatScan: () => invoke<void>("pause_wechat_scan"),
+  resumeWechatScan: () => invoke<void>("resume_wechat_scan"),
+  stopWechatScan: () => invoke<void>("stop_wechat_scan"),
   setWechatWatch: (dir?: string | null, autoclean?: boolean) =>
     invoke<void>("set_wechat_watch", { dir: dir === undefined ? undefined : (dir ?? ""), autoclean }),
   startProcessing: () => invoke<void>("start_processing"),
+  pauseProcessing: () => invoke<void>("pause_processing"),
+  resumeProcessing: () => invoke<void>("resume_processing"),
+  stopProcessing: () => invoke<void>("stop_processing"),
+  restartProcessing: (mode?: "pending" | "all") => invoke<void>("restart_processing", { mode }),
   retryFailed: () => invoke<void>("retry_failed"),
   search: (personId: number, threshold: number) => invoke<Hit[]>("search", { personId, threshold }),
   confirmFace: (faceId: number, personId: number) => invoke<void>("confirm_face", { faceId, personId }),
@@ -156,7 +174,10 @@ export const api = {
   qxcCheckLogin: (token: string) => invoke<string | null>("qxc_check_login", { token }),
   qxcLogout: () => invoke<void>("qxc_logout"),
   qxcAlbums: () => invoke<Album[]>("qxc_albums"),
-  qxcSync: (groupId: string) => invoke<SyncReport>("qxc_sync", { groupId }),
+  qxcSync: (groupId: string, restart = false) => invoke<SyncReport>("qxc_sync", { groupId, restart }),
+  pauseQxcSync: () => invoke<void>("pause_qxc_sync"),
+  resumeQxcSync: () => invoke<void>("resume_qxc_sync"),
+  stopQxcSync: () => invoke<void>("stop_qxc_sync"),
   installChromeExtension: () => invoke<ExtensionInstallResult>("install_chrome_extension"),
   openQxcWeb: () => invoke<void>("open_qxc_web"),
   clearWebCache: () => invoke<void>("clear_web_cache"),

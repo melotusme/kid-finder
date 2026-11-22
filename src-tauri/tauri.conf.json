@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "找娃助手",
   "mainBinaryName": "kid-finder",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "identifier": "com.kidfinder.app",
   "build": {
     "beforeDevCommand": "npm run dev",

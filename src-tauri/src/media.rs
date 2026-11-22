@@ -1,6 +1,6 @@
 //! Import (with duplicate detection, WeChat legacy `.dat` decoding, in-place video indexing,
 //! and staging watch folder), background face + OCR analysis, combined search, and export.
-use crate::{db, download, face, ocr, storage, wechat, AppState};
+use crate::{db, download, face, ocr, storage, wechat, AppState, TASK_IDLE, TASK_PAUSED, TASK_RUNNING, TASK_STOPPED};
 use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -98,6 +98,80 @@ pub struct ImportReport {
     pub duplicates: Vec<Duplicate>,
     pub unsupported: usize,
     pub errors: Vec<String>,
+    pub stopped: bool,
+}
+
+/// Cosine similarity threshold above which two reference face embeddings for the same person
+/// are treated as duplicate/near-identical copies (e.g. re-saved or re-compressed identical photo).
+pub const REF_DUP_COSINE: f32 = 0.96;
+
+pub fn is_duplicate_ref_sha(c: &Connection, person_id: i64, sha: &str) -> Result<bool> {
+    if sha.is_empty() {
+        return Ok(false);
+    }
+    Ok(c.query_row(
+        "SELECT 1 FROM refs WHERE person_id=?1 AND sha256=?2 LIMIT 1",
+        params![person_id, sha],
+        |_| Ok(()),
+    )
+    .optional()?
+    .is_some())
+}
+
+pub fn is_duplicate_ref_embedding(c: &Connection, person_id: i64, emb: &[f32]) -> Result<bool> {
+    let mut s = c.prepare("SELECT embedding FROM refs WHERE person_id=?1")?;
+    let rows = s.query_map([person_id], |r| r.get::<_, Vec<u8>>(0))?;
+    for row in rows {
+        let existing = db::blob_to_emb(&row?);
+        if existing.len() == emb.len() && face::cosine(&existing, emb) >= REF_DUP_COSINE {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Removes already-stored duplicate reference photos for a person (keeping the earliest entry)
+/// by matching either identical `sha256` or near-identical face embedding (`cosine >= REF_DUP_COSINE`).
+pub fn dedup_existing_refs(c: &Connection, person_id: i64) -> Result<usize> {
+    let rows: Vec<(i64, Vec<u8>, Option<String>, Option<String>)> = {
+        let mut s = c.prepare("SELECT id, embedding, thumb, sha256 FROM refs WHERE person_id=?1 ORDER BY id ASC")?;
+        let r = s
+            .query_map([person_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        r
+    };
+    let mut kept_shas: HashSet<String> = HashSet::new();
+    let mut kept_embs: Vec<Vec<f32>> = Vec::new();
+    let mut dup_rows: Vec<(i64, Option<String>)> = Vec::new();
+
+    for (id, blob, thumb, sha_opt) in rows {
+        let emb = db::blob_to_emb(&blob);
+        let sha_dup = sha_opt
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| kept_shas.contains(s))
+            .unwrap_or(false);
+        let emb_dup = kept_embs
+            .iter()
+            .any(|k| k.len() == emb.len() && face::cosine(k, &emb) >= REF_DUP_COSINE);
+        if sha_dup || emb_dup {
+            dup_rows.push((id, thumb));
+        } else {
+            if let Some(s) = sha_opt.filter(|s| !s.is_empty()) {
+                kept_shas.insert(s);
+            }
+            kept_embs.push(emb);
+        }
+    }
+
+    let removed = dup_rows.len();
+    for (id, thumb) in dup_rows {
+        c.execute("DELETE FROM refs WHERE id=?1", [id])?;
+        if let Some(t) = thumb {
+            let _ = std::fs::remove_file(t);
+        }
+    }
+    Ok(removed)
 }
 
 /// Returns `(orig_name, imported_at)` if a file with this hash is already in the library (including purged tombstones).
@@ -288,8 +362,28 @@ pub fn import_paths(app: &AppHandle, paths: Vec<String>) -> Result<ImportReport>
 
 /// Scans discovered local WeChat 4.x / 3.9 plaintext video & file attachment directories in
 /// strictly read-only mode and indexes them in-place (`move_file=false`, zero copy into `library/`).
-pub fn import_wechat_videos(app: &AppHandle) -> Result<ImportReport> {
+/// Supports pause / resume / stop and fast path-cache skip (when `!restart`) so previously
+/// indexed files are skipped immediately without re-reading large video files.
+pub fn import_wechat_videos(app: &AppHandle, restart: bool) -> Result<ImportReport> {
     let st = app.state::<AppState>();
+    let cur = st.wechat_scan_state.load(Ordering::SeqCst);
+    if cur == TASK_RUNNING || cur == TASK_PAUSED {
+        bail!("本机微信缓存扫描正在进行中，请先停止或等待完成");
+    }
+    st.wechat_scan_state.store(TASK_RUNNING, Ordering::SeqCst);
+    let _ = app.emit("task-state", ());
+
+    let res = import_wechat_videos_inner(app, &st, restart);
+
+    let stopped = st.wechat_scan_state.load(Ordering::SeqCst) == TASK_STOPPED
+        || res.as_ref().map(|r| r.stopped).unwrap_or(false);
+    st.wechat_scan_state
+        .store(if stopped { TASK_STOPPED } else { TASK_IDLE }, Ordering::SeqCst);
+    let _ = app.emit("task-state", ());
+    res
+}
+
+fn import_wechat_videos_inner(app: &AppHandle, st: &AppState, restart: bool) -> Result<ImportReport> {
     let sources = wechat::discover_wechat_sources();
     let mut files: Vec<PathBuf> = Vec::new();
     for src in &sources {
@@ -298,15 +392,69 @@ pub fn import_wechat_videos(app: &AppHandle) -> Result<ImportReport> {
     files.sort();
     files.dedup();
 
+    let known_paths: HashMap<String, (String, String)> = if restart {
+        HashMap::new()
+    } else {
+        let c = st.db.lock().unwrap();
+        let mut map = HashMap::new();
+        if let Ok(mut s) = c.prepare("SELECT path, orig_name, imported_at FROM media WHERE source='wechat-local'") {
+            if let Ok(rows) = s.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            }) {
+                for row in rows.flatten() {
+                    map.insert(row.0, (row.1, row.2));
+                }
+            }
+        }
+        map
+    };
+
     let mut rep = ImportReport::default();
     let total = files.len();
     for (i, f) in files.iter().enumerate() {
+        let mut emitted_pause = false;
+        loop {
+            match st.wechat_scan_state.load(Ordering::SeqCst) {
+                TASK_STOPPED => {
+                    rep.stopped = true;
+                    break;
+                }
+                TASK_PAUSED => {
+                    if !emitted_pause {
+                        let _ = app.emit(
+                            "progress",
+                            Progress {
+                                stage: "import",
+                                done: i,
+                                total,
+                                current: "（已暂停）".to_string(),
+                            },
+                        );
+                        emitted_pause = true;
+                    }
+                    std::thread::sleep(Duration::from_millis(150));
+                }
+                _ => break,
+            }
+        }
+        if rep.stopped {
+            break;
+        }
         let name = f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         let _ = app.emit("progress", Progress { stage: "import", done: i, total, current: name.clone() });
         let Some(kind) = kind_of(f) else {
             rep.unsupported += 1;
             continue;
         };
+        let path_key = f.to_string_lossy().to_string();
+        if let Some((existing_name, imported_at)) = known_paths.get(&path_key) {
+            rep.duplicates.push(Duplicate {
+                name: name.clone(),
+                existing_name: existing_name.clone(),
+                imported_at: imported_at.clone(),
+            });
+            continue;
+        }
         let r: Result<()> = (|| {
             let sha = sha256_file(f)?;
             let c = st.db.lock().unwrap();
@@ -423,7 +571,7 @@ pub fn spawn_wechat_watcher(app: AppHandle) {
             .unwrap_or(0);
             if added > 0 {
                 let _ = app.emit("watch-imported", added);
-                spawn_processing(app.clone());
+                spawn_processing_if_allowed(app.clone());
             }
         }
     });
@@ -699,18 +847,69 @@ fn norm_rows(img: &image::RgbImage, faces: Vec<face::Face>, t: Option<f64>) -> V
         .collect()
 }
 
+/// Auto-trigger helper used after imports/syncs/watch folder events:
+/// respects an explicit user `Paused` or `Stopped` state so tasks are never forcibly restarted.
+pub fn spawn_processing_if_allowed(app: AppHandle) {
+    let st = app.state::<AppState>();
+    let cur = st.analyze_state.load(Ordering::SeqCst);
+    if cur == TASK_PAUSED || cur == TASK_STOPPED {
+        let _ = app.emit("task-state", ());
+        return;
+    }
+    spawn_processing(app);
+}
+
 pub fn spawn_processing(app: AppHandle) {
     let st = app.state::<AppState>();
+    st.analyze_state.store(TASK_RUNNING, Ordering::SeqCst);
+    let _ = app.emit("task-state", ());
     if st.processing.swap(true, Ordering::SeqCst) {
         return;
     }
     tauri::async_runtime::spawn_blocking(move || {
         let r = process_all(&app);
         let st = app.state::<AppState>();
+        let was_stopped = st.analyze_state.load(Ordering::SeqCst) == TASK_STOPPED;
+        if !was_stopped {
+            st.analyze_state.store(TASK_IDLE, Ordering::SeqCst);
+        }
         st.processing.store(false, Ordering::SeqCst);
+        let _ = app.emit("task-state", ());
         let _ = app.emit("process-done", r.err().map(|e| format!("{e:#}")));
-        spawn_ocr_backfill(app);
+        if !was_stopped {
+            spawn_ocr_backfill(app);
+        }
     });
+}
+
+fn wait_analyze_control(app: &AppHandle, st: &AppState, done: usize, total: usize, name: &str) -> bool {
+    let mut emitted_pause = false;
+    loop {
+        match st.analyze_state.load(Ordering::SeqCst) {
+            TASK_STOPPED => return true,
+            TASK_PAUSED => {
+                if !emitted_pause {
+                    let _ = app.emit(
+                        "progress",
+                        Progress {
+                            stage: "analyze",
+                            done,
+                            total,
+                            current: format!("（已暂停）{name}"),
+                        },
+                    );
+                    emitted_pause = true;
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            _ => {
+                if emitted_pause {
+                    let _ = app.emit("progress", Progress { stage: "analyze", done, total, current: name.to_string() });
+                }
+                return false;
+            }
+        }
+    }
 }
 
 fn process_all(app: &AppHandle) -> Result<()> {
@@ -730,8 +929,13 @@ fn process_all(app: &AppHandle) -> Result<()> {
             (n, rem)
         };
         let Some((id, kind, path, name)) = next else { break };
-        let _ = app.emit("progress", Progress { stage: "analyze", done, total: done + remaining as usize, current: name });
+        let total = done + remaining as usize;
+        if wait_analyze_control(app, &st, done, total, &name) {
+            break;
+        }
+        let _ = app.emit("progress", Progress { stage: "analyze", done, total, current: name.clone() });
         let thumbs_dir = st.paths().thumbs;
+        let mut aborted_by_stop = false;
         let res: Result<(Vec<FaceRow>, Option<Vec<ocr::OcrBox>>, Option<String>, Option<f64>)> = if kind == "image" {
             analyze_file(&st, Path::new(&path)).map(|(img, faces)| {
                 let poster = save_image_thumb(&thumbs_dir, id, &img).ok();
@@ -739,9 +943,21 @@ fn process_all(app: &AppHandle) -> Result<()> {
                 (norm_rows(&img, faces, None), ocr_boxes, poster, None)
             })
         } else {
-            analyze_video(&st, ffmpeg.as_deref(), id, Path::new(&path))
-                .map(|(rows, poster, duration)| (rows, Some(vec![]), poster, duration))
+            match analyze_video_controlled(&st, ffmpeg.as_deref(), id, Path::new(&path), || {
+                wait_analyze_control(app, &st, done, total, &name)
+            }) {
+                Ok(Some((rows, poster, duration))) => Ok((rows, Some(vec![]), poster, duration)),
+                Ok(None) => {
+                    aborted_by_stop = true;
+                    Ok((vec![], None, None, None))
+                }
+                Err(e) => Err(e),
+            }
         };
+        if aborted_by_stop {
+            // Leave current video as status=0 so resuming later picks it up cleanly.
+            break;
+        }
         let mut c = st.db.lock().unwrap();
         match res {
             Ok((rows, ocr_opt, poster, duration)) => {
@@ -801,6 +1017,20 @@ fn run(mut c: Command) -> Result<()> {
 }
 
 pub fn analyze_video(st: &AppState, ffmpeg: Option<&Path>, id: i64, path: &Path) -> Result<(Vec<FaceRow>, Option<String>, Option<f64>)> {
+    analyze_video_controlled(st, ffmpeg, id, path, || false)?
+        .ok_or_else(|| anyhow!("视频分析已停止"))
+}
+
+fn analyze_video_controlled<F>(
+    st: &AppState,
+    ffmpeg: Option<&Path>,
+    id: i64,
+    path: &Path,
+    mut should_stop: F,
+) -> Result<Option<(Vec<FaceRow>, Option<String>, Option<f64>)>>
+where
+    F: FnMut() -> bool,
+{
     let ff = ffmpeg.ok_or_else(|| anyhow!("未找到 ffmpeg，无法处理视频（请在「设置」页安装）"))?;
     let paths = st.paths();
     let dir = paths.tmp.join(format!("v{id}"));
@@ -812,10 +1042,15 @@ pub fn analyze_video(st: &AppState, ffmpeg: Option<&Path>, id: i64, path: &Path)
     let mut frames: Vec<PathBuf> = std::fs::read_dir(&dir)?.flatten().map(|e| e.path()).collect();
     frames.sort();
     if frames.is_empty() {
+        let _ = std::fs::remove_dir_all(&dir);
         bail!("视频没有可读取的画面");
     }
     let mut rows = vec![];
     for (n, f) in frames.iter().enumerate() {
+        if should_stop() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Ok(None);
+        }
         let (img, faces) = analyze_file(st, f)?;
         rows.extend(norm_rows(&img, faces, Some(n as f64)));
     }
@@ -826,7 +1061,7 @@ pub fn analyze_video(st: &AppState, ffmpeg: Option<&Path>, id: i64, path: &Path)
         .save(&poster)?;
     let duration = frames.len() as f64;
     let _ = std::fs::remove_dir_all(&dir);
-    Ok((rows, Some(poster.to_string_lossy().to_string()), Some(duration)))
+    Ok(Some((rows, Some(poster.to_string_lossy().to_string()), Some(duration))))
 }
 
 static PREVIEW_LOCKS: OnceLock<Mutex<HashMap<i64, Arc<Mutex<()>>>>> = OnceLock::new();
@@ -1582,7 +1817,7 @@ mod tests {
     use super::*;
     use crate::Paths;
     use std::collections::HashMap;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicU8};
     use std::sync::{Mutex, RwLock};
 
     #[test]
@@ -1597,6 +1832,10 @@ mod tests {
             engine: Mutex::new(None),
             ocr_engine: Mutex::new(None),
             processing: AtomicBool::new(false),
+            analyze_state: AtomicU8::new(TASK_IDLE),
+            qxc_state: AtomicU8::new(TASK_IDLE),
+            qxc_group_id: Mutex::new(None),
+            wechat_scan_state: AtomicU8::new(TASK_IDLE),
             ocr_backfilling: AtomicBool::new(false),
             bridge_running: AtomicBool::new(false),
             web_cache: Mutex::new(HashMap::new()),
@@ -2054,6 +2293,10 @@ mod tests {
             engine: Mutex::new(None),
             ocr_engine: Mutex::new(None),
             processing: AtomicBool::new(false),
+            analyze_state: AtomicU8::new(TASK_IDLE),
+            qxc_state: AtomicU8::new(TASK_IDLE),
+            qxc_group_id: Mutex::new(None),
+            wechat_scan_state: AtomicU8::new(TASK_IDLE),
             ocr_backfilling: AtomicBool::new(false),
             bridge_running: AtomicBool::new(false),
             web_cache: Mutex::new(HashMap::new()),
@@ -2097,6 +2340,72 @@ mod tests {
         assert_eq!(PathBuf::from(db_path_after), orig_video);
 
         drop(st);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ref_dedup_blocks_same_sha_and_near_identical_embeddings_while_allowing_distinct_angles() {
+        let root = std::env::temp_dir().join(format!("kid_finder_ref_dedup_test_{}", uuid::Uuid::new_v4()));
+        let paths = Paths::new(root.clone()).unwrap();
+        let conn = db::open(&paths.data.join("kid-finder.db")).unwrap();
+
+        conn.execute("INSERT INTO persons(name, aliases, created_at) VALUES('小宝', '', '2026-11-22 10:00:00')", [])
+            .unwrap();
+        let p1 = conn.last_insert_rowid();
+        conn.execute("INSERT INTO persons(name, aliases, created_at) VALUES('二宝', '', '2026-11-22 10:00:01')", [])
+            .unwrap();
+        let p2 = conn.last_insert_rowid();
+
+        let emb_a = vec![1.0f32, 0.0, 0.0, 0.0];
+        let emb_near = vec![0.99f32, 0.141, 0.0, 0.0]; // cosine ~ 0.990
+        let emb_diff_angle = vec![0.75f32, 0.661, 0.0, 0.0]; // cosine ~ 0.750
+
+        let thumb1 = paths.thumbs.join("ref_keep.jpg");
+        let thumb_dup = paths.thumbs.join("ref_dup.jpg");
+        std::fs::write(&thumb1, b"keep").unwrap();
+        std::fs::write(&thumb_dup, b"dup").unwrap();
+
+        conn.execute(
+            "INSERT INTO refs(person_id, embedding, thumb, source, sha256, created_at) VALUES(?1,?2,?3,'a.jpg','sha_aaa','2026-11-22 10:00:00')",
+            params![p1, db::emb_to_blob(&emb_a), thumb1.to_string_lossy()],
+        )
+        .unwrap();
+
+        // Layer 1: exact SHA-256 blocked for same person, allowed for another person
+        assert!(is_duplicate_ref_sha(&conn, p1, "sha_aaa").unwrap());
+        assert!(!is_duplicate_ref_sha(&conn, p1, "sha_bbb").unwrap());
+        assert!(!is_duplicate_ref_sha(&conn, p2, "sha_aaa").unwrap());
+
+        // Layer 2: near-identical embedding blocked (re-compressed copy), distinct angle allowed
+        assert!(is_duplicate_ref_embedding(&conn, p1, &emb_near).unwrap());
+        assert!(!is_duplicate_ref_embedding(&conn, p1, &emb_diff_angle).unwrap());
+
+        // Simulate legacy duplicate already present in DB and verify dedup_existing_refs cleans it
+        conn.execute(
+            "INSERT INTO refs(person_id, embedding, thumb, source, sha256, created_at) VALUES(?1,?2,?3,'a_copy.jpg',NULL,'2026-11-22 10:00:05')",
+            params![p1, db::emb_to_blob(&emb_near), thumb_dup.to_string_lossy()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO refs(person_id, embedding, thumb, source, sha256, created_at) VALUES(?1,?2,NULL,'b.jpg','sha_bbb','2026-11-22 10:00:06')",
+            params![p1, db::emb_to_blob(&emb_diff_angle)],
+        )
+        .unwrap();
+
+        let removed = dedup_existing_refs(&conn, p1).unwrap();
+        assert_eq!(removed, 1);
+        let remaining: i64 = conn.query_row("SELECT COUNT(*) FROM refs WHERE person_id=?1", [p1], |r| r.get(0)).unwrap();
+        assert_eq!(remaining, 2);
+        assert!(thumb1.exists());
+        assert!(!thumb_dup.exists());
+
+        // Task state names cover full closed-loop lifecycle
+        assert_eq!(crate::task_state_name(TASK_IDLE), "idle");
+        assert_eq!(crate::task_state_name(TASK_RUNNING), "running");
+        assert_eq!(crate::task_state_name(TASK_PAUSED), "paused");
+        assert_eq!(crate::task_state_name(TASK_STOPPED), "stopped");
+
+        drop(conn);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

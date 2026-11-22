@@ -1,10 +1,12 @@
 //! 群相册 (qxc.hi.cn) client: QR login, album list, incremental sync. See docs/qxc-api.md.
-use crate::{db, media, AppState};
+use crate::{db, media, AppState, TASK_IDLE, TASK_PAUSED, TASK_RUNNING, TASK_STOPPED};
 use anyhow::{anyhow, bail, Result};
 use qrcode::{render::svg, QrCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 
 const BASE: &str = "https://cloud-release-3g472rpybcfa654e-1326935991.ap-shanghai.app.tcloudbase.com";
@@ -124,35 +126,122 @@ pub struct SyncReport {
     pub duplicates: usize,
     pub errors: Vec<String>,
     pub complete: bool,
+    pub stopped: bool,
 }
 
 #[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct SyncProgress {
+    group_id: String,
+    state: &'static str,
     page: i64,
     added: usize,
     duplicates: usize,
 }
 
+/// Waits while `qxc_state == TASK_PAUSED`. Returns `true` if stop was requested.
+async fn wait_if_paused(app: &AppHandle, group_id: &str, page: i64, rep: &SyncReport) -> bool {
+    let st = app.state::<AppState>();
+    let mut emitted_pause = false;
+    loop {
+        match st.qxc_state.load(Ordering::SeqCst) {
+            TASK_STOPPED => return true,
+            TASK_PAUSED => {
+                if !emitted_pause {
+                    let _ = app.emit(
+                        "sync-progress",
+                        SyncProgress {
+                            group_id: group_id.to_string(),
+                            state: "paused",
+                            page,
+                            added: rep.added,
+                            duplicates: rep.duplicates,
+                        },
+                    );
+                    emitted_pause = true;
+                }
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            _ => {
+                if emitted_pause {
+                    let _ = app.emit(
+                        "sync-progress",
+                        SyncProgress {
+                            group_id: group_id.to_string(),
+                            state: "running",
+                            page,
+                            added: rep.added,
+                            duplicates: rep.duplicates,
+                        },
+                    );
+                }
+                return false;
+            }
+        }
+    }
+}
+
 /// Incremental sync, newest first. Stops at the first already-known item once a full
 /// pass has completed for this album; until then it skips known items and keeps going
-/// so an interrupted first sync can resume.
-pub async fn sync(app: &AppHandle, group_id: &str) -> Result<SyncReport> {
+/// so an interrupted first sync can resume. Supports pause / resume / stop / restart.
+pub async fn sync(app: &AppHandle, group_id: &str, restart: bool) -> Result<SyncReport> {
+    let st = app.state::<AppState>();
+    let cur_state = st.qxc_state.load(Ordering::SeqCst);
+    if cur_state == TASK_RUNNING || cur_state == TASK_PAUSED {
+        bail!("已有群相册同步任务在进行中，请先停止或等待完成");
+    }
+    st.qxc_state.store(TASK_RUNNING, Ordering::SeqCst);
+    *st.qxc_group_id.lock().unwrap() = Some(group_id.to_string());
+    let _ = app.emit("task-state", ());
+
+    let result = sync_inner(app, group_id, restart).await;
+
+    let final_stopped = st.qxc_state.load(Ordering::SeqCst) == TASK_STOPPED
+        || result.as_ref().map(|r| r.stopped).unwrap_or(false);
+    st.qxc_state.store(if final_stopped { TASK_STOPPED } else { TASK_IDLE }, Ordering::SeqCst);
+    if !final_stopped {
+        *st.qxc_group_id.lock().unwrap() = None;
+    }
+    let _ = app.emit("task-state", ());
+    result
+}
+
+async fn sync_inner(app: &AppHandle, group_id: &str, restart: bool) -> Result<SyncReport> {
     let st = app.state::<AppState>();
     let done_key = format!("qxc_complete:{group_id}");
-    let had_full_pass = db::get_setting(&st.db.lock().unwrap(), &done_key).is_some();
+    if restart {
+        let _ = db::del_setting(&st.db.lock().unwrap(), &done_key);
+    }
+    let had_full_pass = !restart && db::get_setting(&st.db.lock().unwrap(), &done_key).is_some();
     let http = client()?;
     let mut rep = SyncReport::default();
     let mut page = 0i64;
     'outer: loop {
-        let v = get(&st, "getSubFolderMediaForWebV3", &[("groupId", group_id.into()), ("subfolderId", "-1".into()), ("page", page.to_string())]).await?;
+        if wait_if_paused(app, group_id, page, &rep).await {
+            rep.stopped = true;
+            break;
+        }
+        let v = get(
+            &st,
+            "getSubFolderMediaForWebV3",
+            &[("groupId", group_id.into()), ("subfolderId", "-1".into()), ("page", page.to_string())],
+        )
+        .await?;
         let list = v.get("list").and_then(|l| l.as_array()).cloned().unwrap_or_default();
         for it in &list {
+            if wait_if_paused(app, group_id, page, &rep).await {
+                rep.stopped = true;
+                break 'outer;
+            }
             let rid = it.get("_id").and_then(|x| x.as_str()).unwrap_or_default().to_string();
             let url = it.get("tempFileURL").and_then(|x| x.as_str()).unwrap_or_default();
             if rid.is_empty() || url.is_empty() {
                 continue;
             }
-            let known: bool = st.db.lock().unwrap()
+            let known: bool = st
+                .db
+                .lock()
+                .unwrap()
                 .query_row("SELECT 1 FROM media WHERE remote_id=?1", [&rid], |_| Ok(()))
                 .is_ok();
             if known {
@@ -168,7 +257,16 @@ pub async fn sync(app: &AppHandle, group_id: &str) -> Result<SyncReport> {
                 rep.errors.push(format!("{rid}: {e:#}"));
             }
         }
-        let _ = app.emit("sync-progress", SyncProgress { page, added: rep.added, duplicates: rep.duplicates });
+        let _ = app.emit(
+            "sync-progress",
+            SyncProgress {
+                group_id: group_id.to_string(),
+                state: "running",
+                page,
+                added: rep.added,
+                duplicates: rep.duplicates,
+            },
+        );
         if v.get("isEnd").and_then(|x| x.as_bool()).unwrap_or(true) || list.is_empty() {
             if rep.errors.is_empty() {
                 db::set_setting(&st.db.lock().unwrap(), &done_key, "1")?;
@@ -178,7 +276,7 @@ pub async fn sync(app: &AppHandle, group_id: &str) -> Result<SyncReport> {
         }
         page += 1;
     }
-    if had_full_pass {
+    if had_full_pass && !rep.stopped {
         rep.complete = true;
     }
     Ok(rep)

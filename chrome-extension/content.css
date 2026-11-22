@@ -114,6 +114,33 @@
   color: #991b1b;
 }
 
+.kf-task-pill {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-weight: 600;
+}
+
+.kf-task-pill.running {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.kf-task-pill.paused {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.kf-task-pill.stopped {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.kf-task-pill.completed {
+  background: #e0f2fe;
+  color: #075985;
+}
+
 .kf-spacer {
   flex: 1;
 }

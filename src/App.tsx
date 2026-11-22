@@ -127,6 +127,7 @@ export default function App() {
       }),
       listen<void>("persons-changed", () => refresh()),
       listen<void>("ocr-updated", () => refresh()),
+      listen<void>("task-state", () => refresh()),
       listen<number>("watch-imported", (e) => {
         notify(`已从微信中转夹自动入库 ${e.payload} 个新文件`);
         refresh();
@@ -165,7 +166,11 @@ export default function App() {
         {status && (
           <div className="stat">
             库内 {status.images} 张照片 · {status.videos} 个视频
-            {status.pending > 0 && <div>待分析 {status.pending}</div>}
+            <div>
+              已扫记录 {status.analyzed}
+              {status.purged > 0 ? ` · 指纹 ${status.purged}` : ""}
+            </div>
+            {status.pending > 0 && <div>待识别 {status.pending}</div>}
             {status.failed > 0 && (
               <div>
                 失败 {status.failed} <a onClick={() => api.retryFailed().then(refresh)}>重试</a>
@@ -192,13 +197,87 @@ export default function App() {
             </button>
           </div>
         )}
-        {progress && (
+        {progress && progress.stage !== "analyze" && (
           <div className="progress">
-            <span>{{ import: "导入中", analyze: "识别分析中", export: "处理中" }[progress.stage]}</span>
+            <span>{{ import: "导入/扫描中", analyze: "识别分析中", export: "处理中" }[progress.stage]}</span>
             <progress value={progress.done} max={Math.max(progress.total, 1)} />
-            <span>
+            <span className="progress-meta">
               {progress.done}/{progress.total} {progress.current}
             </span>
+          </div>
+        )}
+        {status && (status.analyzeState !== "idle" || status.pending > 0 || (progress && progress.stage === "analyze")) && (
+          <div className="progress">
+            <span className={`task-pill ${status.analyzeState}`}>
+              {
+                {
+                  running: "识别中",
+                  paused: "已暂停",
+                  stopped: "已停止",
+                  idle: "待识别",
+                }[status.analyzeState]
+              }
+            </span>
+            {progress && progress.stage === "analyze" && (
+              <>
+                <progress value={progress.done} max={Math.max(progress.total, 1)} />
+                <span className="progress-meta">
+                  {progress.done}/{progress.total} {progress.current}
+                </span>
+              </>
+            )}
+            {(!progress || progress.stage !== "analyze") && (
+              <span className="progress-meta">
+                已扫记录 {status.analyzed} · 待识别 {status.pending}
+                {status.failed > 0 ? ` · 失败 ${status.failed}` : ""}
+              </span>
+            )}
+            <div className="spacer" />
+            {status.analyzeState === "running" && (
+              <>
+                <button className="ghost small" onClick={() => api.pauseProcessing().then(refresh)}>
+                  暂停
+                </button>
+                <button className="danger small" onClick={() => api.stopProcessing().then(refresh)}>
+                  停止
+                </button>
+              </>
+            )}
+            {status.analyzeState === "paused" && (
+              <>
+                <button className="small" onClick={() => api.resumeProcessing().then(refresh)}>
+                  继续
+                </button>
+                <button className="danger small" onClick={() => api.stopProcessing().then(refresh)}>
+                  停止
+                </button>
+                <button
+                  className="ghost small"
+                  onClick={() =>
+                    confirm("确定停止当前队列并从头重新识别库内所有未清理照片/视频？（已录入的宝宝参考照不受影响）") &&
+                    api.restartProcessing("all").then(refresh).catch((e) => notify(String(e)))
+                  }
+                >
+                  重新开始
+                </button>
+              </>
+            )}
+            {(status.analyzeState === "stopped" || (status.analyzeState === "idle" && status.pending > 0)) && (
+              <>
+                <button className="small" onClick={() => api.resumeProcessing().then(refresh)}>
+                  {status.analyzeState === "stopped" ? "继续剩余" : "开始识别"}
+                </button>
+                <button
+                  className="ghost small"
+                  onClick={() =>
+                    confirm("从头重新识别库内所有未清理照片/视频？（正常只需点「继续剩余」，已扫过的不会重复扫）") &&
+                    api.restartProcessing("all").then(refresh).catch((e) => notify(String(e)))
+                  }
+                >
+                  重新开始
+                </button>
+              </>
+            )}
           </div>
         )}
         {dl && (
@@ -370,6 +449,7 @@ function Kids({ persons, refresh, notify }: Common & { persons: Person[] }) {
     try {
       const r = await api.addRefs(p.id, files as string[]);
       const msg = [`已录入 ${r.added} 张`];
+      if (r.duplicates.length) msg.push(`跳过 ${r.duplicates.length} 张重复照`);
       if (r.noFace.length) msg.push(`${r.noFace.length} 张没检测到人脸`);
       if (r.multiFace.length) msg.push(`${r.multiFace.length} 张有多张脸（已取最大的那张，建议用单人照）`);
       if (r.errors.length) msg.push(`失败：${r.errors.join("；")}`);
@@ -422,6 +502,24 @@ function Kids({ persons, refresh, notify }: Common & { persons: Person[] }) {
             <button disabled={busy === p.id} onClick={() => addRefs(p)}>
               {busy === p.id ? "识别中…" : "添加参考照"}
             </button>
+            {p.refs.length > 1 && (
+              <button
+                className="ghost small"
+                disabled={busy === p.id}
+                title="自动清理同一张或几乎完全相同的重复参考照（保留最早一张）"
+                onClick={async () => {
+                  try {
+                    const removed = await api.dedupPersonRefs(p.id);
+                    notify(removed > 0 ? `已清理「${p.name}」的 ${removed} 张重复参考照` : `「${p.name}」的参考照没有重复`);
+                    await refresh();
+                  } catch (e) {
+                    notify(String(e));
+                  }
+                }}
+              >
+                清理重复照
+              </button>
+            )}
             <button
               className="ghost"
               onClick={() => {
@@ -459,10 +557,11 @@ function ImportResult({ r }: { r: ImportReport }) {
   return (
     <div className="card">
       <div>
+        {r.stopped && <span className="task-pill stopped" style={{ marginRight: 6 }}>已停止</span>}
         新导入 <b>{r.added}</b> 个
         {r.duplicates.length > 0 && (
           <>
-            ，<b className="warn">{r.duplicates.length}</b> 个之前已导入过（已按指纹秒级跳过）
+            ，<b className="warn">{r.duplicates.length}</b> 个之前已记录/缓存过（已自动跳过）
           </>
         )}
         {r.unsupported > 0 && <>，{r.unsupported} 个不是支持的照片/视频</>}
@@ -581,35 +680,83 @@ function WechatAutoCard({
         <div className="wx-subcard">
           <div className="row">
             <b>🎬 本机微信已缓存视频（零拷贝原位识别）</b>
+            {status.wechatScanState !== "idle" && (
+              <span className={`task-pill ${status.wechatScanState}`}>
+                {{ running: "扫描中", paused: "已暂停", stopped: "已停止", idle: "" }[status.wechatScanState]}
+              </span>
+            )}
             <div className="spacer" />
-            <button
-              className="ghost small"
-              disabled={scanningWx}
-              onClick={async () => {
-                setScanningWx(true);
-                try {
-                  const rep = await api.importWechatVideos();
-                  onReport(rep);
-                  notify(
-                    `微信缓存扫描完成：新增索引 ${rep.added} 个` +
-                      (rep.duplicates.length ? `，跳过已有 ${rep.duplicates.length} 个` : ""),
-                  );
-                  await refresh();
-                  api.discoverWechat().then(setSources).catch(() => {});
-                } catch (e) {
-                  notify(String(e));
-                }
-                setScanningWx(false);
-              }}
-            >
-              {scanningWx ? "扫描中…" : "扫描本机微信已缓存视频（零拷贝）"}
-            </button>
+            {scanningWx || status.wechatScanState === "running" || status.wechatScanState === "paused" ? (
+              <>
+                {status.wechatScanState === "paused" ? (
+                  <button className="small" onClick={() => api.resumeWechatScan().then(refresh)}>
+                    继续
+                  </button>
+                ) : (
+                  <button className="ghost small" onClick={() => api.pauseWechatScan().then(refresh)}>
+                    暂停
+                  </button>
+                )}
+                <button className="danger small" onClick={() => api.stopWechatScan().then(refresh)}>
+                  停止
+                </button>
+              </>
+            ) : (
+              <>
+                <button
+                  className="ghost small"
+                  onClick={async () => {
+                    setScanningWx(true);
+                    try {
+                      const rep = await api.importWechatVideos(false);
+                      onReport(rep);
+                      notify(
+                        (rep.stopped ? "已停止微信缓存扫描：" : "微信缓存扫描完成：") +
+                          `新增索引 ${rep.added} 个` +
+                          (rep.duplicates.length ? `，跳过已记录缓存 ${rep.duplicates.length} 个` : ""),
+                      );
+                      await refresh();
+                      api.discoverWechat().then(setSources).catch(() => {});
+                    } catch (e) {
+                      notify(String(e));
+                    }
+                    setScanningWx(false);
+                  }}
+                >
+                  {status.wechatScanState === "stopped" ? "继续扫描新增" : "扫描微信已缓存视频"}
+                </button>
+                <button
+                  className="ghost small"
+                  title="跳过路径快缓存，从头按 SHA-256 核对全部本机微信视频（已入库的仍不会重复保存）"
+                  onClick={async () => {
+                    setScanningWx(true);
+                    try {
+                      const rep = await api.importWechatVideos(true);
+                      onReport(rep);
+                      notify(
+                        (rep.stopped ? "已停止重新核对：" : "重新核对完成：") +
+                          `新增索引 ${rep.added} 个` +
+                          (rep.duplicates.length ? `，已有记录 ${rep.duplicates.length} 个` : ""),
+                      );
+                      await refresh();
+                      api.discoverWechat().then(setSources).catch(() => {});
+                    } catch (e) {
+                      notify(String(e));
+                    }
+                    setScanningWx(false);
+                  }}
+                >
+                  重新核对
+                </button>
+              </>
+            )}
           </div>
           <div className="muted small" style={{ marginTop: 4 }}>
             {sources.length > 0 ? (
               <>
-                已发现本机微信目录 {sources.length} 个（{sources.map((s) => `微信 ${s.generation}`).join("、")}），共检测到已下载明文视频{" "}
-                <b>{totalWxVideos}</b> 个{totalWxFiles > 0 ? `、文件附件 ${totalWxFiles} 个` : ""}。原位抽帧分析不复制大视频文件，绝不改动微信目录。
+                已发现本机微信目录 {sources.length} 个（{sources.map((s) => `微信 ${s.generation}`).join("、")}），检测到明文视频{" "}
+                <b>{totalWxVideos}</b> 个{totalWxFiles > 0 ? `、文件附件 ${totalWxFiles} 个` : ""}；本机数据库已永久记录微信媒体{" "}
+                <b>{status.wechatCached}</b> 个（已扫过的自动秒级跳过，不重复入库）。
               </>
             ) : (
               "未在默认位置检测到已下载的电脑微信明文视频（在微信设置开启「自动下载在其他设备查看过的内容」后，手机看过的群视频会自动同步到电脑）。"
@@ -732,8 +879,12 @@ function Qxc({ status, refresh, notify }: Common & { status: Status }) {
   }, [status.qxcUser, notify]);
 
   useEffect(() => {
-    const un = listen<{ page: number; added: number; duplicates: number }>("sync-progress", (e) =>
-      setSyncInfo(`第 ${e.payload.page + 1} 页 · 新增 ${e.payload.added} · 已有 ${e.payload.duplicates}`),
+    const un = listen<{ groupId?: string; state?: string; page: number; added: number; duplicates: number }>(
+      "sync-progress",
+      (e) =>
+        setSyncInfo(
+          `${e.payload.state === "paused" ? "【已暂停】" : ""}第 ${e.payload.page + 1} 页 · 新增 ${e.payload.added} · 已记录跳过 ${e.payload.duplicates}`,
+        ),
     );
     return () => {
       un.then((f) => f());
@@ -765,36 +916,72 @@ function Qxc({ status, refresh, notify }: Common & { status: Status }) {
           <div>请用微信扫码，并在手机上确认登录</div>
         </div>
       )}
-      {albums?.map((a) => (
-        <div className="row album" key={a.groupId}>
-          <span>{a.groupName}</span>
-          <span className="muted">
-            {a.imgCnt} 张 · {a.videoCnt} 个视频
-          </span>
-          <div className="spacer" />
-          {syncing === a.groupId && <span className="muted">{syncInfo}</span>}
-          <button
-            disabled={syncing !== null}
-            onClick={async () => {
-              setSyncing(a.groupId);
-              setSyncInfo("");
-              try {
-                const r = await api.qxcSync(a.groupId);
-                notify(
-                  `同步完成：新增 ${r.added} 个，${r.duplicates} 个之前已有（已跳过）` +
-                    (r.errors.length ? `，${r.errors.length} 个失败` : ""),
-                );
-              } catch (e) {
-                notify(String(e));
-              }
-              setSyncing(null);
-              refresh();
-            }}
-          >
-            {syncing === a.groupId ? "同步中…" : "同步"}
-          </button>
-        </div>
-      ))}
+      {albums?.map((a) => {
+        const activeThis = syncing === a.groupId || status.qxcActiveGroup === a.groupId;
+        const isRunningThis = activeThis && status.qxcState === "running";
+        const isPausedThis = activeThis && status.qxcState === "paused";
+        const isStoppedThis = activeThis && status.qxcState === "stopped";
+        const busyAny = syncing !== null || status.qxcState === "running" || status.qxcState === "paused";
+        const runSync = async (restart: boolean) => {
+          setSyncing(a.groupId);
+          setSyncInfo("");
+          try {
+            const r = await api.qxcSync(a.groupId, restart);
+            notify(
+              (r.stopped ? "已停止群相册同步：" : restart ? "重新核对同步完成：" : "同步完成：") +
+                `新增 ${r.added} 个，${r.duplicates} 个之前已记录（已跳过）` +
+                (r.errors.length ? `，${r.errors.length} 个失败` : ""),
+            );
+          } catch (e) {
+            notify(String(e));
+          }
+          setSyncing(null);
+          refresh();
+        };
+        return (
+          <div className="row album" key={a.groupId}>
+            <span>{a.groupName}</span>
+            <span className="muted">
+              {a.imgCnt} 张 · {a.videoCnt} 个视频
+            </span>
+            {isRunningThis && <span className="task-pill running">同步中</span>}
+            {isPausedThis && <span className="task-pill paused">已暂停</span>}
+            {isStoppedThis && <span className="task-pill stopped">已停止</span>}
+            <div className="spacer" />
+            {activeThis && syncInfo && <span className="muted small">{syncInfo}</span>}
+            {isRunningThis || isPausedThis ? (
+              <>
+                {isPausedThis ? (
+                  <button className="small" onClick={() => api.resumeQxcSync().then(refresh)}>
+                    继续
+                  </button>
+                ) : (
+                  <button className="ghost small" onClick={() => api.pauseQxcSync().then(refresh)}>
+                    暂停
+                  </button>
+                )}
+                <button className="danger small" onClick={() => api.stopQxcSync().then(refresh)}>
+                  停止
+                </button>
+              </>
+            ) : (
+              <>
+                <button className="small" disabled={busyAny} onClick={() => runSync(false)}>
+                  {isStoppedThis ? "继续同步" : "增量同步"}
+                </button>
+                <button
+                  className="ghost small"
+                  disabled={busyAny}
+                  title="从第 1 页重新核对整本相册（之前同步过的仍按记录跳过，不会重复下载）"
+                  onClick={() => runSync(true)}
+                >
+                  重新开始
+                </button>
+              </>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }

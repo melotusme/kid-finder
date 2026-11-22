@@ -1740,10 +1740,15 @@ async fn api_enroll(app: &AppHandle, req: EnrollReq) -> Result<Value> {
         };
 
         let thumbs_dir = st.paths().thumbs;
-        let (mut added, mut no_face, mut multi_face) = (0usize, 0usize, 0usize);
+        let (mut added, mut duplicates, mut no_face, mut multi_face) = (0usize, 0usize, 0usize, 0usize);
         for raw in &req.images {
             let b64 = raw.split_once(',').map(|(_, b)| b).unwrap_or(raw.as_str());
             let bytes = B64.decode(b64.trim()).map_err(|e| anyhow!("图片解码失败: {e}"))?;
+            let sha = media::sha256_bytes(&bytes);
+            if media::is_duplicate_ref_sha(&st.db.lock().unwrap(), person_id, &sha)? {
+                duplicates += 1;
+                continue;
+            }
             let img = face::load_image_bytes(&bytes)?;
             let faces = st
                 .engine
@@ -1757,14 +1762,18 @@ async fn api_enroll(app: &AppHandle, req: EnrollReq) -> Result<Value> {
                 no_face += 1;
                 continue;
             };
+            if media::is_duplicate_ref_embedding(&st.db.lock().unwrap(), person_id, &best.embedding)? {
+                duplicates += 1;
+                continue;
+            }
             if faces.len() > 1 {
                 multi_face += 1;
             }
             let thumb = thumbs_dir.join(format!("ref_{}.jpg", uuid::Uuid::new_v4()));
             face::face_thumb(&img, &best.bbox, 160).save(&thumb)?;
             st.db.lock().unwrap().execute(
-                "INSERT INTO refs(person_id, embedding, thumb, source, created_at) VALUES(?1,?2,?3,?4,?5)",
-                params![person_id, db::emb_to_blob(&best.embedding), thumb.to_string_lossy(), "chrome-ext", db::now()],
+                "INSERT INTO refs(person_id, embedding, thumb, source, sha256, created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![person_id, db::emb_to_blob(&best.embedding), thumb.to_string_lossy(), "chrome-ext", sha, db::now()],
             )?;
             added += 1;
         }
@@ -1773,6 +1782,7 @@ async fn api_enroll(app: &AppHandle, req: EnrollReq) -> Result<Value> {
             "ok": true,
             "personId": person_id,
             "added": added,
+            "duplicates": duplicates,
             "noFace": no_face,
             "multiFace": multi_face,
         }))

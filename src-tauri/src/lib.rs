@@ -14,10 +14,24 @@ use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Mutex, RwLock};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
+
+pub const TASK_IDLE: u8 = 0;
+pub const TASK_RUNNING: u8 = 1;
+pub const TASK_PAUSED: u8 = 2;
+pub const TASK_STOPPED: u8 = 3;
+
+pub fn task_state_name(v: u8) -> &'static str {
+    match v {
+        TASK_RUNNING => "running",
+        TASK_PAUSED => "paused",
+        TASK_STOPPED => "stopped",
+        _ => "idle",
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Paths {
@@ -61,6 +75,10 @@ pub struct AppState {
     pub engine: Mutex<Option<face::FaceEngine>>,
     pub ocr_engine: Mutex<Option<ocr::OcrEngine>>,
     pub processing: AtomicBool,
+    pub analyze_state: AtomicU8,
+    pub qxc_state: AtomicU8,
+    pub qxc_group_id: Mutex<Option<String>>,
+    pub wechat_scan_state: AtomicU8,
     pub ocr_backfilling: AtomicBool,
     pub bridge_running: AtomicBool,
     pub web_cache: Mutex<HashMap<String, bridge::CachedScan>>,
@@ -93,9 +111,16 @@ struct Status {
     ocr_models_ready: bool,
     ffmpeg: Option<String>,
     processing: bool,
+    analyze_state: &'static str,
+    qxc_state: &'static str,
+    qxc_active_group: Option<String>,
+    wechat_scan_state: &'static str,
     total: i64,
+    analyzed: i64,
     pending: i64,
     failed: i64,
+    purged: i64,
+    wechat_cached: i64,
     images: i64,
     videos: i64,
     qxc_user: Option<String>,
@@ -124,8 +149,15 @@ async fn get_status(app: AppHandle) -> CmdResult<Status> {
         let active_images: i64 = c.query_row("SELECT COUNT(*) FROM media WHERE kind='image' AND status != ?1", [purged], |r| r.get(0))?;
         let active_videos: i64 = c.query_row("SELECT COUNT(*) FROM media WHERE kind='video' AND status != ?1", [purged], |r| r.get(0))?;
         let active_total: i64 = c.query_row("SELECT COUNT(*) FROM media WHERE status != ?1", [purged], |r| r.get(0))?;
+        let purged_count: i64 = c.query_row("SELECT COUNT(*) FROM media WHERE status = ?1", [purged], |r| r.get(0))?;
+        let wechat_cached: i64 = c.query_row(
+            "SELECT COUNT(*) FROM media WHERE source IN ('wechat-local','wechat-watch','wechat-dat') AND status != ?1",
+            [purged],
+            |r| r.get(0),
+        )?;
         let wechat_watch_dir = db::get_setting(&c, "wechat_watch_dir").filter(|s| !s.trim().is_empty());
         let wechat_watch_autoclean = db::get_setting(&c, "wechat_watch_autoclean").as_deref() == Some("1");
+        let qxc_active_group = st.qxc_group_id.lock().unwrap().clone();
         Ok(Status {
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             extension_version: extension::bundled_extension_version().to_string(),
@@ -133,9 +165,16 @@ async fn get_status(app: AppHandle) -> CmdResult<Status> {
             ocr_models_ready: download::ocr_models_ready(&paths),
             ffmpeg,
             processing: st.processing.load(Ordering::SeqCst),
+            analyze_state: task_state_name(st.analyze_state.load(Ordering::SeqCst)),
+            qxc_state: task_state_name(st.qxc_state.load(Ordering::SeqCst)),
+            qxc_active_group,
+            wechat_scan_state: task_state_name(st.wechat_scan_state.load(Ordering::SeqCst)),
             total: active_total,
+            analyzed: n("SELECT COUNT(*) FROM media WHERE status=1")?,
             pending: n("SELECT COUNT(*) FROM media WHERE status=0")?,
             failed: n("SELECT COUNT(*) FROM media WHERE status=2")?,
+            purged: purged_count,
+            wechat_cached,
             images: active_images,
             videos: active_videos,
             qxc_user,
@@ -168,7 +207,7 @@ async fn download_models(app: AppHandle) -> CmdResult<()> {
     let paths = app.state::<AppState>().paths();
     download::download_models(&app, &paths).await.map_err(err)?;
     media::spawn_ocr_backfill(app.clone());
-    media::spawn_processing(app);
+    media::spawn_processing_if_allowed(app);
     Ok(())
 }
 
@@ -321,12 +360,14 @@ async fn delete_person(app: AppHandle, id: i64) -> CmdResult<()> {
 #[serde(rename_all = "camelCase")]
 struct RefReport {
     added: usize,
+    duplicates: Vec<String>,
     no_face: Vec<String>,
     multi_face: Vec<String>,
     errors: Vec<String>,
 }
 
-/// Enrol reference photos. When a photo has several faces the largest one is used.
+/// Enrol reference photos with two-layer deduplication (exact file SHA-256 + near-identical
+/// face embedding cosine >= 0.96). When a photo has several faces the largest one is used.
 #[tauri::command]
 async fn add_refs(app: AppHandle, person_id: i64, paths: Vec<String>) -> CmdResult<RefReport> {
     let a = app.clone();
@@ -339,20 +380,29 @@ async fn add_refs(app: AppHandle, person_id: i64, paths: Vec<String>) -> CmdResu
             let pb = PathBuf::from(&p);
             let name = pb.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or(p.clone());
             let r: Result<()> = (|| {
+                let sha = media::sha256_file(&pb)?;
+                if media::is_duplicate_ref_sha(&st.db.lock().unwrap(), person_id, &sha)? {
+                    rep.duplicates.push(name.clone());
+                    return Ok(());
+                }
                 let (img, faces) = media::analyze_file(&st, &pb)?;
                 let area = |f: &face::Face| (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]);
                 let Some(best) = faces.iter().max_by(|a, b| area(a).total_cmp(&area(b))) else {
                     rep.no_face.push(name.clone());
                     return Ok(());
                 };
+                if media::is_duplicate_ref_embedding(&st.db.lock().unwrap(), person_id, &best.embedding)? {
+                    rep.duplicates.push(name.clone());
+                    return Ok(());
+                }
                 if faces.len() > 1 {
                     rep.multi_face.push(name.clone());
                 }
                 let thumb = thumbs_dir.join(format!("ref_{}.jpg", uuid::Uuid::new_v4()));
                 face::face_thumb(&img, &best.bbox, 160).save(&thumb)?;
                 st.db.lock().unwrap().execute(
-                    "INSERT INTO refs(person_id, embedding, thumb, source, created_at) VALUES(?1,?2,?3,?4,?5)",
-                    params![person_id, db::emb_to_blob(&best.embedding), thumb.to_string_lossy(), p, db::now()],
+                    "INSERT INTO refs(person_id, embedding, thumb, source, sha256, created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![person_id, db::emb_to_blob(&best.embedding), thumb.to_string_lossy(), p, sha, db::now()],
                 )?;
                 rep.added += 1;
                 Ok(())
@@ -366,6 +416,21 @@ async fn add_refs(app: AppHandle, person_id: i64, paths: Vec<String>) -> CmdResu
     .await?;
     let _ = app.emit("persons-changed", ());
     Ok(rep)
+}
+
+#[tauri::command]
+async fn dedup_person_refs(app: AppHandle, person_id: i64) -> CmdResult<usize> {
+    let a = app.clone();
+    let removed = blocking(move || {
+        let st = a.state::<AppState>();
+        let c = st.db.lock().unwrap();
+        media::dedup_existing_refs(&c, person_id)
+    })
+    .await?;
+    if removed > 0 {
+        let _ = app.emit("persons-changed", ());
+    }
+    Ok(removed)
 }
 
 #[tauri::command]
@@ -391,7 +456,7 @@ async fn delete_ref(app: AppHandle, id: i64) -> CmdResult<()> {
 async fn import_paths(app: AppHandle, paths: Vec<String>) -> CmdResult<media::ImportReport> {
     let a = app.clone();
     let rep = blocking(move || media::import_paths(&a, paths)).await?;
-    media::spawn_processing(app);
+    media::spawn_processing_if_allowed(app);
     Ok(rep)
 }
 
@@ -401,13 +466,38 @@ async fn discover_wechat() -> CmdResult<Vec<wechat::WechatSource>> {
 }
 
 #[tauri::command]
-async fn import_wechat_videos(app: AppHandle) -> CmdResult<media::ImportReport> {
+async fn import_wechat_videos(app: AppHandle, restart: Option<bool>) -> CmdResult<media::ImportReport> {
     let a = app.clone();
-    let rep = blocking(move || media::import_wechat_videos(&a)).await?;
-    if rep.added > 0 {
-        media::spawn_processing(app);
+    let do_restart = restart.unwrap_or(false);
+    let rep = blocking(move || media::import_wechat_videos(&a, do_restart)).await?;
+    if rep.added > 0 && !rep.stopped {
+        media::spawn_processing_if_allowed(app);
     }
     Ok(rep)
+}
+
+#[tauri::command]
+fn pause_wechat_scan(app: AppHandle) {
+    let st = app.state::<AppState>();
+    let _ = st.wechat_scan_state.compare_exchange(TASK_RUNNING, TASK_PAUSED, Ordering::SeqCst, Ordering::SeqCst);
+    let _ = app.emit("task-state", ());
+}
+
+#[tauri::command]
+fn resume_wechat_scan(app: AppHandle) {
+    let st = app.state::<AppState>();
+    let _ = st.wechat_scan_state.compare_exchange(TASK_PAUSED, TASK_RUNNING, Ordering::SeqCst, Ordering::SeqCst);
+    let _ = app.emit("task-state", ());
+}
+
+#[tauri::command]
+fn stop_wechat_scan(app: AppHandle) {
+    let st = app.state::<AppState>();
+    let cur = st.wechat_scan_state.load(Ordering::SeqCst);
+    if cur == TASK_RUNNING || cur == TASK_PAUSED {
+        st.wechat_scan_state.store(TASK_STOPPED, Ordering::SeqCst);
+        let _ = app.emit("task-state", ());
+    }
 }
 
 #[tauri::command]
@@ -452,7 +542,7 @@ async fn set_wechat_watch(app: AppHandle, dir: Option<String>, autoclean: Option
         let added = blocking(move || media::poll_wechat_watch_once(&a2.state::<AppState>())).await?;
         if added > 0 {
             let _ = app.emit("watch-imported", added);
-            media::spawn_processing(app);
+            media::spawn_processing_if_allowed(app);
         }
     }
     Ok(())
@@ -464,10 +554,73 @@ fn start_processing(app: AppHandle) {
 }
 
 #[tauri::command]
+fn pause_processing(app: AppHandle) {
+    let st = app.state::<AppState>();
+    let _ = st.analyze_state.compare_exchange(TASK_RUNNING, TASK_PAUSED, Ordering::SeqCst, Ordering::SeqCst);
+    let _ = app.emit("task-state", ());
+}
+
+#[tauri::command]
+fn resume_processing(app: AppHandle) {
+    let st = app.state::<AppState>();
+    if st.processing.load(Ordering::SeqCst) {
+        st.analyze_state.store(TASK_RUNNING, Ordering::SeqCst);
+        let _ = app.emit("task-state", ());
+    } else {
+        media::spawn_processing(app);
+    }
+}
+
+#[tauri::command]
+fn stop_processing(app: AppHandle) {
+    let st = app.state::<AppState>();
+    let cur = st.analyze_state.load(Ordering::SeqCst);
+    if cur == TASK_RUNNING || cur == TASK_PAUSED || st.processing.load(Ordering::SeqCst) {
+        st.analyze_state.store(TASK_STOPPED, Ordering::SeqCst);
+        let _ = app.emit("task-state", ());
+    }
+}
+
+#[tauri::command]
+async fn restart_processing(app: AppHandle, mode: Option<String>) -> CmdResult<()> {
+    let a = app.clone();
+    let reset_all = mode.as_deref() == Some("all");
+    blocking(move || {
+        let st = a.state::<AppState>();
+        if st.processing.load(Ordering::SeqCst) {
+            st.analyze_state.store(TASK_STOPPED, Ordering::SeqCst);
+            let _ = a.emit("task-state", ());
+            for _ in 0..80 {
+                if !st.processing.load(Ordering::SeqCst) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            if st.processing.load(Ordering::SeqCst) {
+                bail!("当前识别任务正在结束最后一个文件，请稍后再点重新开始");
+            }
+        }
+        let c = st.db.lock().unwrap();
+        if reset_all {
+            c.execute(
+                "UPDATE media SET status=0, ocr_done=0, error=NULL WHERE status != ?1",
+                [storage::STATUS_PURGED],
+            )?;
+        } else {
+            c.execute("UPDATE media SET status=0, error=NULL WHERE status=2", [])?;
+        }
+        Ok(())
+    })
+    .await?;
+    media::spawn_processing(app);
+    Ok(())
+}
+
+#[tauri::command]
 async fn retry_failed(app: AppHandle) -> CmdResult<()> {
     let a = app.clone();
     blocking(move || {
-        a.state::<AppState>().db.lock().unwrap().execute("UPDATE media SET status=0 WHERE status=2", [])?;
+        a.state::<AppState>().db.lock().unwrap().execute("UPDATE media SET status=0, error=NULL WHERE status=2", [])?;
         Ok(())
     })
     .await?;
@@ -500,20 +653,28 @@ async fn confirm_face(app: AppHandle, face_id: i64, person_id: i64) -> CmdResult
             [face_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, [r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?])),
         )?;
-        let mut thumb: Option<String> = None;
-        if kind == "image" {
-            if let Ok(img) = face::load_image(Path::new(&path)) {
-                let (w, h) = (img.width() as f32, img.height() as f32);
-                let t = thumbs_dir.join(format!("ref_{}.jpg", uuid::Uuid::new_v4()));
-                if face::face_thumb(&img, &[b[0] * w, b[1] * h, b[2] * w, b[3] * h], 160).save(&t).is_ok() {
-                    thumb = Some(t.to_string_lossy().to_string());
+        let src_tag = format!("face:{face_id}");
+        let emb_vec = db::blob_to_emb(&emb);
+        let already_same_face: bool = c
+            .query_row("SELECT 1 FROM refs WHERE person_id=?1 AND source=?2 LIMIT 1", params![person_id, src_tag], |_| Ok(()))
+            .is_ok();
+        let already_similar = already_same_face || media::is_duplicate_ref_embedding(&c, person_id, &emb_vec)?;
+        if !already_similar {
+            let mut thumb: Option<String> = None;
+            if kind == "image" {
+                if let Ok(img) = face::load_image(Path::new(&path)) {
+                    let (w, h) = (img.width() as f32, img.height() as f32);
+                    let t = thumbs_dir.join(format!("ref_{}.jpg", uuid::Uuid::new_v4()));
+                    if face::face_thumb(&img, &[b[0] * w, b[1] * h, b[2] * w, b[3] * h], 160).save(&t).is_ok() {
+                        thumb = Some(t.to_string_lossy().to_string());
+                    }
                 }
             }
+            c.execute(
+                "INSERT INTO refs(person_id, embedding, thumb, source, created_at) VALUES(?1,?2,?3,?4,?5)",
+                params![person_id, emb, thumb, src_tag, db::now()],
+            )?;
         }
-        c.execute(
-            "INSERT INTO refs(person_id, embedding, thumb, source, created_at) VALUES(?1,?2,?3,?4,?5)",
-            params![person_id, emb, thumb, format!("face:{face_id}"), db::now()],
-        )?;
         c.execute("DELETE FROM rejections WHERE face_id=?1 AND person_id=?2", params![face_id, person_id])?;
         Ok(())
     })
@@ -662,10 +823,36 @@ async fn qxc_albums(app: AppHandle) -> CmdResult<Vec<qxc::Album>> {
 }
 
 #[tauri::command]
-async fn qxc_sync(app: AppHandle, group_id: String) -> CmdResult<qxc::SyncReport> {
-    let rep = qxc::sync(&app, &group_id).await.map_err(err)?;
-    media::spawn_processing(app);
+async fn qxc_sync(app: AppHandle, group_id: String, restart: Option<bool>) -> CmdResult<qxc::SyncReport> {
+    let rep = qxc::sync(&app, &group_id, restart.unwrap_or(false)).await.map_err(err)?;
+    if rep.added > 0 && !rep.stopped {
+        media::spawn_processing_if_allowed(app);
+    }
     Ok(rep)
+}
+
+#[tauri::command]
+fn pause_qxc_sync(app: AppHandle) {
+    let st = app.state::<AppState>();
+    let _ = st.qxc_state.compare_exchange(TASK_RUNNING, TASK_PAUSED, Ordering::SeqCst, Ordering::SeqCst);
+    let _ = app.emit("task-state", ());
+}
+
+#[tauri::command]
+fn resume_qxc_sync(app: AppHandle) {
+    let st = app.state::<AppState>();
+    let _ = st.qxc_state.compare_exchange(TASK_PAUSED, TASK_RUNNING, Ordering::SeqCst, Ordering::SeqCst);
+    let _ = app.emit("task-state", ());
+}
+
+#[tauri::command]
+fn stop_qxc_sync(app: AppHandle) {
+    let st = app.state::<AppState>();
+    let cur = st.qxc_state.load(Ordering::SeqCst);
+    if cur == TASK_RUNNING || cur == TASK_PAUSED {
+        st.qxc_state.store(TASK_STOPPED, Ordering::SeqCst);
+        let _ = app.emit("task-state", ());
+    }
 }
 
 // ---------------- Chrome 扩展安装入口 ----------------
@@ -712,6 +899,10 @@ pub fn run() {
                 engine: Mutex::new(None),
                 ocr_engine: Mutex::new(None),
                 processing: AtomicBool::new(false),
+                analyze_state: AtomicU8::new(TASK_IDLE),
+                qxc_state: AtomicU8::new(TASK_IDLE),
+                qxc_group_id: Mutex::new(None),
+                wechat_scan_state: AtomicU8::new(TASK_IDLE),
                 ocr_backfilling: AtomicBool::new(false),
                 bridge_running: AtomicBool::new(false),
                 web_cache: Mutex::new(HashMap::new()),
@@ -734,12 +925,20 @@ pub fn run() {
             update_person_profile,
             delete_person,
             add_refs,
+            dedup_person_refs,
             delete_ref,
             import_paths,
             discover_wechat,
             import_wechat_videos,
+            pause_wechat_scan,
+            resume_wechat_scan,
+            stop_wechat_scan,
             set_wechat_watch,
             start_processing,
+            pause_processing,
+            resume_processing,
+            stop_processing,
+            restart_processing,
             retry_failed,
             search,
             confirm_face,
@@ -755,6 +954,9 @@ pub fn run() {
             qxc_logout,
             qxc_albums,
             qxc_sync,
+            pause_qxc_sync,
+            resume_qxc_sync,
+            stop_qxc_sync,
             install_chrome_extension,
             open_qxc_web,
             clear_web_cache,

@@ -19,7 +19,7 @@ pub fn open(path: &Path) -> Result<Connection> {
         CREATE TABLE IF NOT EXISTS refs(
             id INTEGER PRIMARY KEY,
             person_id INTEGER NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
-            embedding BLOB NOT NULL, thumb TEXT, source TEXT, created_at TEXT NOT NULL);
+            embedding BLOB NOT NULL, thumb TEXT, source TEXT, sha256 TEXT, created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS media(
             id INTEGER PRIMARY KEY,
             sha256 TEXT NOT NULL UNIQUE,
@@ -77,6 +77,8 @@ pub fn open(path: &Path) -> Result<Connection> {
     )?;
     // Idempotent column migrations for databases created by earlier versions.
     let _ = c.execute("ALTER TABLE persons ADD COLUMN aliases TEXT NOT NULL DEFAULT ''", []);
+    let _ = c.execute("ALTER TABLE refs ADD COLUMN sha256 TEXT", []);
+    let _ = c.execute("CREATE INDEX IF NOT EXISTS refs_person_sha ON refs(person_id, sha256)", []);
     let _ = c.execute("ALTER TABLE media ADD COLUMN ocr_done INTEGER NOT NULL DEFAULT 0", []);
     let _ = c.execute("ALTER TABLE web_scans ADD COLUMN ocr_done INTEGER NOT NULL DEFAULT 0", []);
     Ok(c)

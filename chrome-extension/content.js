@@ -79,6 +79,9 @@
     showEnroll: false,
     enrolling: false,
     scanning: false,
+    scanStatus: "idle", // 'idle' | 'running' | 'paused' | 'stopped' | 'completed'
+    scanMode: null, // 'incremental' | 'full'
+    scanRunId: 0,
     clipping: false,
     stopRequested: false,
     progressDone: 0,
@@ -568,7 +571,19 @@
     return streak;
   }
 
-  async function scanUnscannedOnPage() {
+  function isRunCancelled(runId) {
+    return state.stopRequested || runId !== state.scanRunId;
+  }
+
+  async function waitIfPaused(runId) {
+    while (state.scanStatus === "paused" && !isRunCancelled(runId)) {
+      await sleep(150);
+    }
+    return isRunCancelled(runId);
+  }
+
+  async function scanUnscannedOnPage(runId) {
+    if (await waitIfPaused(runId)) return { photos: 0, videos: 0 };
     await syncPageScannedState(false);
     const candidates = getSelectedCandidates();
     const todoPhotos = candidates.filter((it) => !it.isVideo && !state.results.has(it.id));
@@ -585,7 +600,7 @@
 
     // 1. 批量扫描新照片（缩略图极速识别）
     for (let i = 0; i < todoPhotos.length; i += BATCH_SIZE) {
-      if (state.stopRequested) break;
+      if (await waitIfPaused(runId)) break;
       const chunk = todoPhotos.slice(i, i + BATCH_SIZE);
       state.progressDone = photosDone;
       state.progressTotal = totalTodo;
@@ -625,7 +640,7 @@
 
     // 2. 逐个下载并 1fps 全帧分析新视频
     for (let i = 0; i < todoVideos.length; i++) {
-      if (state.stopRequested) break;
+      if (await waitIfPaused(runId)) break;
       const v = todoVideos[i];
       state.progressDone = photosDone + videosDone;
       state.progressTotal = totalTodo;
@@ -714,8 +729,10 @@
     }
   }
 
-  async function startScan(mode) {
-    if (state.scanning || state.clipping) return;
+  async function startScan(mode, opts = {}) {
+    const isRestart = Boolean(opts && opts.restart);
+    if (state.clipping) return;
+    if (state.scanning && !isRestart) return;
     if (!state.selectPhotos && !state.selectVideos) {
       state.notice = { type: "warn", text: "请至少勾选「照片」或「视频」中的一项。" };
       render();
@@ -773,9 +790,19 @@
     if (mode === "full") {
       state.includeCached = true;
     }
+    if (isRestart) {
+      const topScroller = findScrollContainer();
+      if (topScroller) topScroller.scrollTop = 0;
+      state.sessionNewIds.clear();
+    }
 
+    const runId = ++state.scanRunId;
     state.scanning = true;
+    state.scanMode = mode;
+    state.scanStatus = "running";
     state.stopRequested = false;
+    state.progressDone = 0;
+    state.progressTotal = 0;
     state.notice = null;
     let newPhotos = 0;
     let newVideos = 0;
@@ -784,14 +811,15 @@
 
     try {
       await ensureBatchMode();
-      const first = await scanUnscannedOnPage();
+      const first = await scanUnscannedOnPage(runId);
       newPhotos += first.photos;
       newVideos += first.videos;
 
       const scroller = findScrollContainer();
       let idleRounds = 0;
 
-      while (!state.stopRequested && idleRounds < 2) {
+      while (!isRunCancelled(runId) && idleRounds < 2) {
+        if (await waitIfPaused(runId)) break;
         if (mode === "incremental") {
           const cands = getSelectedCandidates();
           if (countTrailingOldScanned(cands) >= INCREMENTAL_STOP_STREAK) {
@@ -812,22 +840,25 @@
 
         let grew = false;
         for (let wait = 0; wait < 14; wait++) {
-          if (state.stopRequested) break;
+          if (await waitIfPaused(runId)) break;
           await sleep(220);
           if (collectPageItems().length > prevCount) {
             grew = true;
             break;
           }
         }
+        if (isRunCancelled(runId)) break;
         if (grew) {
           idleRounds = 0;
-          const more = await scanUnscannedOnPage();
+          const more = await scanUnscannedOnPage(runId);
           newPhotos += more.photos;
           newVideos += more.videos;
         } else {
           idleRounds++;
         }
       }
+
+      if (runId !== state.scanRunId) return;
 
       if (scroller && !state.stopRequested) {
         scroller.scrollTop = 0;
@@ -847,6 +878,12 @@
         clipReport = await exportMatchedVideos(videoIdsToClip, true);
       }
 
+      if (state.stopRequested) {
+        state.scanStatus = "stopped";
+      } else {
+        state.scanStatus = "completed";
+      }
+
       if (!state.notice) {
         const scannedParts = [];
         if (newPhotos > 0) scannedParts.push(`${newPhotos} 张新照片`);
@@ -854,11 +891,14 @@
         const scannedStr = scannedParts.length ? `新扫 ${scannedParts.join("、")}` : "没有未扫的新内容";
         const boundaryTip = hitIncrementalBoundary ? "（已到达存量边界自动停止）" : "";
         if (state.stopRequested) {
-          state.notice = { type: "warn", text: `已停止。本次${scannedStr}（已永久缓存），页面已勾选 ${state.checkedCount} 项。` };
+          state.notice = {
+            type: "warn",
+            text: `已停止。本次${scannedStr}（已永久记录到本机缓存，下次自动跳过），页面已勾选 ${state.checkedCount} 项。`,
+          };
         } else if (newPhotos === 0 && newVideos === 0 && mode === "incremental") {
           state.notice = {
             type: "ok",
-            text: `没有发现新增内容，本页此前均已扫过。如需重新勾选/裁剪历史存量，可勾选「同时勾选已扫存量」或点「补扫全部存量」。`,
+            text: `没有发现新增内容，本页此前均已扫过并有记录。如需重新勾选/裁剪历史存量，可勾选「同时包含已扫存量」或点「补扫全部存量」。`,
           };
         } else {
           const ocrNote = state.matchedOcrCount > 0 ? `（含作品署名 ${state.matchedOcrCount} 张）` : "";
@@ -869,12 +909,17 @@
         }
       }
     } catch (err) {
-      state.notice = { type: "err", text: `处理出错：${err.message || err}` };
+      if (runId === state.scanRunId) {
+        state.scanStatus = "stopped";
+        state.notice = { type: "err", text: `处理出错：${err.message || err}` };
+      }
     } finally {
-      state.scanning = false;
-      state.stopRequested = false;
-      state.progressLabel = "";
-      render();
+      if (runId === state.scanRunId) {
+        state.scanning = false;
+        state.stopRequested = false;
+        state.progressLabel = "";
+        render();
+      }
     }
   }
 
@@ -1003,6 +1048,7 @@
         state.showEnroll = false;
       }
       const parts = [`已录入 ${r.added} 张参考照`];
+      if (r.duplicates > 0) parts.push(`跳过 ${r.duplicates} 张重复照`);
       if (r.noFace > 0) parts.push(`${r.noFace} 张未检测到人脸`);
       if (r.multiFace > 0) parts.push(`${r.multiFace} 张检测到多张脸（已取最大人脸）`);
       if (r.added > 0) parts.push("已用本机缓存重新打分，无需重新下载");
@@ -1034,11 +1080,17 @@
       const label =
         state.connected && !state.versionCompatible
           ? `找娃助手 v${EXT_VERSION} · 版本不匹配`
-          : state.checkedCount > 0
-            ? `找娃助手 · 已勾 ${state.checkedCount}`
-            : unscanned > 0
-              ? `找娃助手 · ${unscanned} 项未扫`
-              : `找娃助手 v${EXT_VERSION}`;
+          : state.scanStatus === "paused"
+            ? `找娃助手 · 已暂停 (${state.progressDone}/${state.progressTotal || "?"})`
+            : state.scanStatus === "running"
+              ? `找娃助手 · 扫描中 (${state.progressDone}/${state.progressTotal || "?"})`
+              : state.scanStatus === "stopped"
+                ? `找娃助手 · 已停止`
+                : state.checkedCount > 0
+                  ? `找娃助手 · 已勾 ${state.checkedCount}`
+                  : unscanned > 0
+                    ? `找娃助手 · ${unscanned} 项未扫`
+                    : `找娃助手 v${EXT_VERSION}`;
       root.innerHTML = `
         <button class="kf-pill" id="kf-open">
           <span class="kf-pill-dot ${pillWarn ? "off" : ""}"></span>
@@ -1200,12 +1252,39 @@
 
             <div class="kf-row">
               ${
-                state.scanning
-                  ? `<button class="kf-btn danger" id="kf-stop">停止扫描</button>`
-                  : `<button class="kf-btn" id="kf-scan-inc" ${!hasReadyKid || busy || (!state.selectPhotos && !state.selectVideos) ? "disabled" : ""} title="只扫新增照片/视频，遇到已扫存量自动停止">扫新增并勾选</button>
-                     <button class="kf-btn secondary" id="kf-scan-full" ${!hasReadyKid || busy || (!state.selectPhotos && !state.selectVideos) ? "disabled" : ""} title="首次处理整本相册或补全存量，已扫过的自动跳过">补扫全部存量</button>`
+                state.scanning && state.scanStatus === "running"
+                  ? `<button class="kf-btn secondary" id="kf-pause">暂停</button>
+                     <button class="kf-btn danger" id="kf-stop">停止</button>`
+                  : state.scanning && state.scanStatus === "paused"
+                    ? `<button class="kf-btn" id="kf-resume">继续扫描</button>
+                       <button class="kf-btn danger small" id="kf-stop">停止</button>
+                       <button class="kf-btn secondary small" id="kf-restart">重新开始</button>`
+                    : state.scanStatus === "stopped"
+                      ? `<button class="kf-btn" id="kf-continue" ${!hasReadyKid || busy || (!state.selectPhotos && !state.selectVideos) ? "disabled" : ""}>继续扫描</button>
+                         <button class="kf-btn secondary" id="kf-restart" ${!hasReadyKid || busy || (!state.selectPhotos && !state.selectVideos) ? "disabled" : ""}>重新开始</button>`
+                      : `<button class="kf-btn" id="kf-scan-inc" ${!hasReadyKid || busy || (!state.selectPhotos && !state.selectVideos) ? "disabled" : ""} title="只扫新增照片/视频，遇到已扫存量自动停止">扫新增并勾选</button>
+                         <button class="kf-btn secondary" id="kf-scan-full" ${!hasReadyKid || busy || (!state.selectPhotos && !state.selectVideos) ? "disabled" : ""} title="首次处理整本相册或补全存量，已扫过的自动跳过">补扫全部存量</button>`
               }
             </div>
+            ${
+              state.scanStatus !== "idle"
+                ? `<div class="kf-row" style="justify-content:space-between;">
+                     <span class="kf-task-pill ${state.scanStatus}">${
+                       {
+                         running: "任务状态：扫描中",
+                         paused: "任务状态：已暂停",
+                         stopped: "任务状态：已停止",
+                         completed: "任务状态：已完成",
+                       }[state.scanStatus] || ""
+                     }</span>
+                     ${
+                       state.scanStatus === "completed" && !busy
+                         ? `<button class="kf-link" id="kf-restart" title="回到顶部重新跑一遍当前扫描（已扫过的仍走本机缓存，不重复下载）">重新开始</button>`
+                         : ""
+                     }
+                   </div>`
+                : ""
+            }
 
             <div class="kf-row" style="justify-content:space-between;">
               <label class="kf-check" title="开启后会把之前扫过的存量命中照片/视频也一起勾选和裁剪（0 下载，直接读本机缓存）">
@@ -1371,9 +1450,34 @@
     if ($("#kf-scan-full")) {
       $("#kf-scan-full").onclick = () => startScan("full");
     }
+    if ($("#kf-pause")) {
+      $("#kf-pause").onclick = () => {
+        if (state.scanning && state.scanStatus === "running") {
+          state.scanStatus = "paused";
+          state.progressLabel = "已暂停，等待继续…";
+          render();
+        }
+      };
+    }
+    if ($("#kf-resume")) {
+      $("#kf-resume").onclick = () => {
+        if (state.scanning && state.scanStatus === "paused") {
+          state.scanStatus = "running";
+          state.progressLabel = "继续扫描中…";
+          render();
+        }
+      };
+    }
+    if ($("#kf-continue")) {
+      $("#kf-continue").onclick = () => startScan(state.scanMode || "incremental", { restart: false });
+    }
+    if ($("#kf-restart")) {
+      $("#kf-restart").onclick = () => startScan(state.scanMode || "incremental", { restart: true });
+    }
     if ($("#kf-stop")) {
       $("#kf-stop").onclick = () => {
         state.stopRequested = true;
+        state.scanStatus = "stopped";
         state.progressLabel = "正在停止…";
         render();
       };
